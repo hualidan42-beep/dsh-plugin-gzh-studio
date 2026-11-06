@@ -1,0 +1,59 @@
+{
+  "name": "dsh-plugin-gzh-studio",
+  "version": "0.2.0",
+  "description": "新媒体内容工作台：21 条内容类型的合规检查、逐张出图与版本留存、手机宽度预览、推公众号草稿、视频成片预览；抖音 / 小红书 / 快手 的发布包在规划中。",
+  "license": "MIT",
+  "type": "module",
+  "main": "./index.js",
+  "files": [
+    "index.js",
+    "client.js",
+    "lib/",
+    "cordis.patch.yml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "author": "孙爱珍",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "wechat",
+    "gzh",
+    "公众号",
+    "image-deck",
+    "workbench"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hualidan42-beep/dsh-plugin-gzh-studio.git"
+  },
+  "homepage": "https://github.com/hualidan42-beep/dsh-plugin-gzh-studio#readme",
+  "scripts": {
+    "verify": "node verify/client-harness.mjs && node verify/host-smoke.mjs && node verify/stream-unit.mjs && node verify/push-unit.mjs && node verify/video-media-unit.mjs && node verify/tracks-unit.mjs && node verify/targets-unit.mjs && node verify/route-check.mjs && node verify/class-check.mjs && node verify/layout-split.mjs && node verify/pack-check.mjs && node verify/install-check.mjs",
+    "pack:check": "node verify/pack-check.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "renderer",
+        "layout",
+        "sidebar"
+      ]
+    }
+  }
+}

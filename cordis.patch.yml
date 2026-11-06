@@ -1,0 +1,5 @@
+# The plugin-bundle patch layer: contributes the 公众号工作台 service and its
+# authenticated /api/gzh-studio.* routes to the DSH web profile's Cordis tree.
+- insert:
+  - id: gzh-studio
+    name: 'dsh-plugin-gzh-studio'
