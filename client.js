@@ -25,28 +25,6 @@ window.__ModuleLoader__.load({
     const h = React.createElement;
 
     /**
-     * 公众号配置的提交体：**只包含用户真正填过的字段**。
-     *
-     * 界面回填的是掩码（`wx1234…abcd`），所以「留空」必须等于「不改」——
-     * 否则点一次「改配置」再保存，空串会把已经存好的 AppID / AppSecret 抹掉。
-     */
-    function wechatConfigPayload(form = {}) {
-      const payload = { mode: form.mode === "gateway" ? "gateway" : "direct" };
-      const appId = String(form.appId ?? "").trim();
-      const secret = String(form.appSecret ?? "").trim();
-      if (appId) payload.appId = appId;
-      if (secret) payload.appSecret = secret;
-      payload.author = String(form.author ?? "").trim();
-      if (payload.mode === "gateway") {
-        payload.gateway = {
-          baseURL: String(form.gatewayURL ?? "").trim(),
-          token: String(form.gatewayToken ?? "").trim(),
-        };
-      }
-      return payload;
-    }
-
-    /**
      * 面板注册键（main 与 sidebar.panellist 必须同一个 key，否则点了没反应）。 */
     const PANEL_KEY = "gzh-studio";
     /** 面板在侧边栏列表里的名字。 */
@@ -86,11 +64,16 @@ window.__ModuleLoader__.load({
       state: "/api/gzh-studio.state",
       article: "/api/gzh-studio.article",
       create: "/api/gzh-studio.create",
+      // 删一篇（移到回收站，不硬删）。宿主没重启时这条不存在，界面会明说
+      remove: "/api/gzh-studio.remove",
       save: "/api/gzh-studio.save",
       generate: "/api/gzh-studio.generate",
       pick: "/api/gzh-studio.pick",
       feedback: "/api/gzh-studio.feedback",
       export: "/api/gzh-studio.export",
+      // 推草稿箱：状态（配没配）+ 真推一次。宿主没重启时这两条不存在，界面会明说
+      wechatStatus: "/api/gzh-studio.wechatStatus",
+      push: "/api/gzh-studio.push",
       image: "/api/gzh-studio.image",
       node: "/api/gzh-studio.node",
       brief: "/api/gzh-studio.brief",
@@ -106,15 +89,11 @@ window.__ModuleLoader__.load({
       review: "/api/gzh-studio.review",
   // 实时同步（SSE）：写盘事件。宿主旧版没有这条路由时，面板安静退回手动刷新。
   stream: "/api/gzh-studio.stream",
-  // 推草稿：公众号凭据 / 推一次
-  wechatStatus: "/api/gzh-studio.wechatStatus",
-  wechatConfig: "/api/gzh-studio.wechatConfig",
-  push: "/api/gzh-studio.push",
       // 仓库真源（只读）：往期稿件列表 + 单篇。写盘的一律不接——
       // 真源归仓库，面板只借来看，改稿仍然改工作台自己库里那份。
       repo: "/api/gzh-studio.repo",
       repoArticle: "/api/gzh-studio.repoArticle",
-      // 公司视频号（只读）：期列表 + 单期。
+      // 视频号（只读）：期列表 + 单期。
       //
       // 这两个常量曾经漏写，`getJson(ROUTES.video)` 于是 fetch 了 `/undefined`，
       // 宿主回 404，面板把它判成「路由未启用」并让人去重启宿主 —— 重启一百次也没用。
@@ -122,6 +101,8 @@ window.__ModuleLoader__.load({
       // 专门盯这一件事：代码里用到的 ROUTES 键必须都在这里定义。
       video: "/api/gzh-studio.video",
       videoEpisode: "/api/gzh-studio.videoEpisode",
+      // 视频目录空态上的两个动作：指到已有目录（path）/ 建出约定目录（create）
+      videoSetup: "/api/gzh-studio.videoSetup",
       // 视频期里的媒体文件（成片 / 封面 / 分镜图 / 字幕）：带 Range，<video> 才能拖进度条。
       media: "/api/gzh-studio.media",
     };
@@ -145,25 +126,50 @@ window.__ModuleLoader__.load({
       return error;
     }
 
+    /**
+     * 一条请求最多等 15 秒。
+     *
+     * 裸 `fetch` 没有上限：宿主进程活着、那条路由却不返回时，按钮点下去永远是「没反应」，
+     * 人只能猜是慢还是死。给个硬上限，至少能弹一句人话。
+     * 不用 `AbortSignal.timeout`——老 WebView / 内嵌 Electron 里没有它，这里要能直接跑。
+     */
+    const REQUEST_TIMEOUT_MS = 15_000;
+
+    /**
+     * 一次 JSON 请求的公共壳：超时 + 解析 + 非 2xx 抛错。
+     *
+     * 超时走 `AbortController`，`finally` 里必清定时器：不清的话每个请求都会留一个
+     * 15 秒后才响的 timer，长会话里攒着不放。abort 抛出来的错误名各浏览器不一致
+     * （`AbortError` / `DOMException`），所以只认 signal 自己的状态。
+     */
+    async function requestJson(url, init = {}) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+      try {
+        const response = await fetch(url, { ...init, credentials: "same-origin", signal: controller.signal });
+        const data = await response.json().catch(() => null);
+        if (!response.ok) throw httpError(response, data);
+        return data;
+      } catch (error) {
+        if (controller.signal.aborted) throw new Error("宿主 15 秒没响应，可能卡住了");
+        throw error;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
     /** GET JSON；非 2xx 抛错（把宿主回的 error.message 原样带上，不吞）。 */
     async function getJson(url) {
-      const response = await fetch(url, { credentials: "same-origin" });
-      const data = await response.json().catch(() => null);
-      if (!response.ok) throw httpError(response, data);
-      return data;
+      return requestJson(url);
     }
 
     /** POST JSON；同上。 */
     async function postJson(url, body) {
-      const response = await fetch(url, {
+      return requestJson(url, {
         method: "POST",
-        credentials: "same-origin",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body ?? {}),
       });
-      const data = await response.json().catch(() => null);
-      if (!response.ok) throw httpError(response, data);
-      return data;
     }
 
     /** 图片地址（带版本，换版本就换地址，不吃旧缓存）。 */
@@ -215,11 +221,38 @@ window.__ModuleLoader__.load({
       return list.find((t) => t.id === id) ?? list[0];
     }
 
+    /**
+     * 模板的**显示名**：模板清单里有就用中文名，没有就照原样显示 id。
+     *
+     * 和 `templateOf` 的区别是「猜不猜」：`templateOf` 的职责是永远给出一套能用的 token，
+     * 所以拿不到就退回默认那套；但卡片上写的是给人看的名字，拿不到时显示 id（business）
+     * 比冒充「默认」诚实——用户会看出这套模板没加载，而不是以为自己的稿被换了模板。
+     */
+    function templateName(templates, id) {
+      if (!id) return "";
+      const list = Array.isArray(templates) ? templates : [];
+      const hit = list.find((t) => t && t.id === id);
+      return hit?.name || String(id);
+    }
+
     /** 正文 `**加粗**` → 片段数组（与导出器的极简语法一致）。 */
     function rich(text) {
       const parts = String(text ?? "").split(/\*\*([^*\n]+)\*\*/g);
       return parts.map((part, index) =>
         index % 2 === 1 ? h("strong", { key: index, style: { fontWeight: 600 } }, part) : part);
+    }
+
+    /**
+     * 绝对路径压成「看得懂的短路径」：取末两级。
+     *
+     * 面板上要显示「我正在读哪个目录」，但一整条 `D:\我的内容仓库\07-video\episode`
+     * 会顶掉标题。末两级（`07-video/episode`）既能认出是哪儿，又不会撑破一行。
+     * 原路径放 `title`，想核对全文再悬停。
+     */
+    function shortPath(path) {
+      const parts = String(path ?? "").split(/[\\/]+/).filter(Boolean);
+      if (!parts.length) return "";
+      return parts.slice(-2).join("/");
     }
 
     /** 正文按空行切段。 */
@@ -333,12 +366,24 @@ window.__ModuleLoader__.load({
 
 /* 顶栏分三组（2026-11-04）：左＝版式与频道 / 中＝身份（这是哪篇）/ 右＝动作。
    分组不是为了好看，是为了「动作要一眼找得到」：原来 12 个控件平铺，
-   用户找一个「往期」得从左读到右。 */
-.gzs-headgroup{display:flex;align-items:center;gap:6px;flex:0 0 auto;min-width:0}
-.gzs-headgroup--mid{flex:1 1 auto;min-width:0;gap:8px}
+   用户找一个「往期」得从左读到右。
+   0.3.4：组自己也要能换行（flex-wrap），否则窄面板里是**整条溢出**——
+   1100 的窗口上「图片清单」直接被切掉半颗按钮（实测 rootOverflow 54）。 */
+.gzs-headgroup{display:flex;align-items:center;gap:6px;flex:0 1 auto;min-width:0;flex-wrap:wrap;row-gap:4px}
+/* flex-basis 给小一点：auto 会按内容撑到最大再换行，结果是「左边一组 + 中间一组」
+   明明放得下却各占一行（1280 下顶栏被撑成三行）。给个 380 的基准让它先挤进来，
+   剩下的空间它再 grow 掉。 */
+.gzs-headgroup--mid{flex:1 1 380px;min-width:0;gap:8px}
 .gzs-headgroup--mid .gzs-title{flex:0 0 auto}
 .gzs-headgroup--mid .gzs-select{flex:0 1 220px;min-width:120px}
 .gzs-headgroup__ctx{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:30ch}
+/* 窄窗口下别让「当前：…」占着地方把按钮挤到第三行：视口越窄，它越短 */
+@media (max-width:1400px){.gzs-headgroup__ctx{max-width:16ch}}
+@media (max-width:1320px){.gzs-headgroup__ctx{display:none}}
+/* 630 左右的窄面板里，顶栏那三组每行只能放一组：先把「重复信息」摘掉——
+   面板标题在侧栏已经写了一次、实时状态在窄屏退成一个点。 */
+@media (max-width:1320px){.gzs-head .gzs-title{display:none}.gzs-live{font-size:0;padding:2px 5px}.gzs-live:before{content:"●";font-size:9px}}
+@media (max-width:1200px){.gzs-headgroup__ctx{max-width:10ch}}
 /* 组与组之间只隔一条细线：比加间距更能说明「这是三块」 */
 .gzs-headgroup+.gzs-headgroup{padding-left:8px;border-left:1px solid var(--gzs-line2)}
 
@@ -356,6 +401,16 @@ window.__ModuleLoader__.load({
 .gzs-btn--ghost{background:var(--gzs-tint);border-color:transparent;color:var(--gzs-teal);font-weight:600}
 .gzs-btn--ghost:hover:not(:disabled){background:var(--gzs-tint);border-color:transparent;color:var(--gzs-teal)}
 .gzs-btn--sm{padding:4px 9px;font-size:11px}
+/* 导出收成 meta 行右端的一颗菜单：它是文章级动作，不该占着手机预览头顶那一行 */
+.gzs-export{position:relative;flex:0 0 auto}
+.gzs-export>summary{list-style:none;cursor:pointer}
+.gzs-export>summary::-webkit-details-marker{display:none}
+.gzs-export[open]>summary{border-color:var(--gzs-cyan);color:var(--gzs-teal)}
+.gzs-export__menu{position:absolute;right:0;top:calc(100% + 6px);z-index:40;min-width:172px;
+  display:flex;flex-direction:column;align-items:stretch;gap:4px;padding:8px;background:var(--gzs-card);
+  border:1px solid var(--gzs-line);border-radius:10px;box-shadow:0 12px 30px rgba(23,54,42,.16)}
+.gzs-export__menu .gzs-btn{justify-content:flex-start}
+.gzs-export__menu .gzs-hint{font-size:10.5px;padding:2px 4px}
 .gzs-select{padding:5px 8px;border:1px solid var(--gzs-line);border-radius:6px;background:var(--gzs-card);
   font:inherit;font-size:11.5px;color:var(--gzs-ink);max-width:190px;cursor:pointer}
 .gzs-input,.gzs-area{width:100%;padding:7px 9px;border:1px solid var(--gzs-line);border-radius:6px;
@@ -392,6 +447,21 @@ window.__ModuleLoader__.load({
    现在：左栏 / 右栏各有一条可拖拽的分隔条，宽度记在本地；
    顶栏改成可换行，宁可多占一行也不藏按钮。 */
 .gzs-body{display:flex;flex:1;min-height:0;overflow-x:auto;overflow-y:hidden}
+/* ── 窄面板：分段（结构 / 成稿 / 检查器），不横向滚 ────────────────────────
+   1280 窗口打开左栏对话后工作区只有 629px，三栏最低要 891。原来靠 overflow-x 兜底，
+   滚动条一被 --hide-scrollbars 之类藏掉，右侧那栏就等于消失。 */
+.gzs-compact{display:flex;flex-direction:column;flex:1;min-height:0;min-width:0;overflow:hidden}
+.gzs-panes{flex:0 0 auto;display:flex;gap:4px;padding:5px 10px;background:var(--gzs-card2);
+  border-bottom:1px solid var(--gzs-line2)}
+.gzs-panes__b{padding:3px 11px;border:1px solid transparent;border-radius:6px;background:transparent;
+  font:inherit;font-size:11.5px;color:var(--gzs-muted);cursor:pointer}
+.gzs-panes__b:hover{color:var(--gzs-ink)}
+.gzs-panes__b.is-on{background:var(--gzs-card);border-color:var(--gzs-line);color:var(--gzs-teal);font-weight:600}
+.gzs-panes__wrap{flex:1;min-height:0;min-width:0;display:flex;overflow:hidden}
+.gzs-pane{display:none;flex:1 1 auto;min-width:0;min-height:0;flex-direction:column;overflow:hidden}
+.gzs-pane.is-on{display:flex}
+.gzs-pane--mid{background:var(--gzs-paper)}
+.gzs-pane--right{background:var(--gzs-card);overflow-y:auto}
 .gzs-col{display:flex;flex-direction:column;min-height:0}
 .gzs-col--left{flex:0 0 252px;background:var(--gzs-card2);overflow:hidden}
 /* 中栏的下限**分两档**，靠出处不同：
@@ -407,6 +477,8 @@ window.__ModuleLoader__.load({
    否则 JS 以为拖得动、浏览器却把它撑回去。 */
 .gzs-col--mid{flex:1;min-width:427px;align-items:stretch;overflow:hidden;padding:0;background:var(--gzs-paper)}
 .gzs-col--right{flex:0 0 336px;background:var(--gzs-card);overflow-y:auto}
+/* 「参数」跳过来时闪一下：窄面板里那一栏可能滚在视野外，没有这一下等于点了没反应 */
+.gzs-col--flash{box-shadow:inset 0 0 0 2px var(--gzs-cyan);transition:box-shadow .18s ease-out}
 
 /* 窄到三栏实在放不下时，给一条明示。
    没有这条，用户看到的只是「右栏不见了」——而「不见了」和「被藏起来了」
@@ -487,7 +559,6 @@ window.__ModuleLoader__.load({
 .gzs-steptag--ok{color:var(--gzs-ok)}
 .gzs-steptag--doing{color:var(--gzs-warn)}
 .gzs-steptag--miss{color:var(--gzs-err)}
-.gzs-railbind{padding:0 12px 10px}
 /* 结构列表最多占左栏 38%：再高就会把上面 11 步挤成半行滚动 */
 .gzs-railfoot{border-top:1px solid var(--gzs-line2);flex:0 0 auto;max-height:38%;overflow:auto;padding:6px 0 10px}
 .gzs-railfoot__head{display:flex;align-items:center;gap:6px;width:100%;border:0;background:transparent;
@@ -499,7 +570,7 @@ window.__ModuleLoader__.load({
 /* ── 中栏：正文舞台（成稿 / 手机预览 / 排版）──────────────────────────── */
 .gzs-stage{flex:1;min-width:0;overflow-y:auto;padding:20px 26px 60px;background:var(--gzs-paper)}
 .gzs-stagehead{padding-bottom:12px;border-bottom:1px solid var(--gzs-line)}
-.gzs-stagetitle{font-family:var(--gzs-serif);font-size:27px;line-height:1.28;margin:0;
+.gzs-stagetitle{font-family:var(--gzs-serif);font-size:29px;line-height:1.25;margin:0;
   font-weight:600;color:var(--gzs-ink);letter-spacing:.01em}
 .gzs-stage-sub{margin:6px 0 0;font-size:12.5px;line-height:1.6;color:var(--gzs-muted)}
 .gzs-meta{display:flex;align-items:center;gap:16px;margin-top:12px;font-size:12px;color:var(--gzs-faint);flex-wrap:wrap}
@@ -508,10 +579,18 @@ window.__ModuleLoader__.load({
 /* 受众可能是整句，截断而不是撑开——撑开会把右边的视图切换挤到第二行 */
 .gzs-meta__aud{display:inline-block;max-width:22ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom}
 .gzs-seg--view{margin-left:auto}
-.gzs-doc{margin-top:20px;max-width:660px}
-.gzs-doc p{font-size:15px;line-height:1.95;color:var(--gzs-body);margin:0 0 18px}
-.gzs-doc h3.gzs-doch{font-family:var(--gzs-serif);font-size:17px;font-weight:600;line-height:1.4;
-  color:var(--gzs-ink);margin:30px 0 12px;padding-left:11px;border-left:3px solid var(--gzs-teal);cursor:pointer}
+/* 正文列**居中限宽**：中栏再宽也不让一行字横穿 1200px。
+   并排去掉之后，宽度换来的应该是留白，不是第二份正文。 */
+/* 阅读列 700：15.5px 中文一行约 45 字，再宽眼睛要回头找行首。
+   宽度换来的留白是「让眼睛休息」，不是把字铺满整屏。 */
+.gzs-stagelay{max-width:700px;margin:0 auto}
+.gzs-doc{margin-top:22px;max-width:none}
+/* 手机那一列：一张纸 + 一行说明。说明在**纸外**——375 这种工程参数不该印进读者的画面 */
+.gzs-phonepane{display:flex;flex-direction:column;align-items:center;min-width:0}
+.gzs-phoneview{display:flex;flex-direction:column;align-items:center;margin-top:6px}
+.gzs-doc p{font-size:15.5px;line-height:2;color:var(--gzs-body);margin:0 0 22px;letter-spacing:.01em}
+.gzs-doc h3.gzs-doch{font-family:var(--gzs-serif);font-size:18px;font-weight:600;line-height:1.45;
+  color:var(--gzs-ink);margin:36px 0 14px;padding-left:11px;border-left:3px solid var(--gzs-teal);cursor:pointer}
 .gzs-doch:hover{color:var(--gzs-teal)}
 .gzs-docsummary{background:var(--gzs-card);border:1px solid var(--gzs-line);border-left:3px solid var(--gzs-cyan);
   border-radius:8px;padding:12px 16px;margin:16px 0 0;font-size:13px;line-height:1.7;color:var(--gzs-body)}
@@ -534,20 +613,25 @@ window.__ModuleLoader__.load({
   padding:7px 11px;border-top:1px solid var(--gzs-line2)}
 .gzs-docgap{margin:2px 0 18px;padding:10px 12px;border:1px dashed var(--gzs-line);border-radius:8px;
   font-size:11.5px;color:var(--gzs-faint);background:var(--gzs-card2);cursor:pointer;text-align:center}
-.gzs-phonewrap{width:${PHONE_WIDTH + 22}px;margin:18px auto 0;background:#101b16;border-radius:34px;padding:11px;
-  box-shadow:0 18px 44px rgba(16,32,24,.24)}
+/* 「一页纸」而不是「一部手机」：这套 UI 是浅绿纸 + 细线 + 衬线标题，再压一块黑机身就成了贴纸。
+   壳只负责圆角、一条细边和一档极淡的投影，视觉重心还给正文。 */
+.gzs-phonewrap{width:${PHONE_WIDTH + 24}px;margin:18px auto 0;padding:12px;background:var(--gzs-card);
+  border:1px solid var(--gzs-line);border-radius:14px;box-shadow:0 6px 18px rgba(23,54,42,.06);
+  transition:box-shadow .16s,border-color .16s}
+.gzs-phonewrap:hover{box-shadow:0 10px 26px rgba(23,54,42,.1);border-color:var(--gzs-line)}
 /* 窄窗：375 的真机宽度塞不进中栏时，整块**等比缩小**——不横向裁切、也不用横向滚动条。
    用 zoom 而不是 transform：zoom 会参与布局，后面的内容不会压上来。 */
+/* 窄面板才缩「手机预览」：列宽钉死的情况下再叠一层 zoom 就等于缩两次，
+   画面会比标注的 375 小一截。 */
 @media (max-width:1300px){
-  .gzs-phonewrap{zoom:.78}
+  .gzs-phoneview .gzs-phonewrap{zoom:.78}
 }
 @media (max-width:1150px){
-  .gzs-phonewrap{zoom:.66}
+  .gzs-phoneview .gzs-phonewrap{zoom:.66}
 }
 .gzs-layout{margin-top:18px;max-width:660px}
 .gzs-layoutcard{border:1px solid var(--gzs-line);border-radius:10px;background:var(--gzs-card);padding:18px 20px}
 .gzs-layouthd{font-family:var(--gzs-serif);font-size:15px;font-weight:600;color:var(--gzs-ink);margin:0 0 6px}
-.gzs-layoutacts{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
 .gzs-layoutlist{margin:12px 0 0;padding:0;list-style:none;font-size:11.5px;line-height:1.7;color:var(--gzs-muted)}
 .gzs-layoutlist li{padding:4px 0;border-top:1px dashed var(--gzs-line2)}
 .gzs-layoutlist li:first-child{border-top:0}
@@ -576,17 +660,24 @@ window.__ModuleLoader__.load({
 
 /* ── 中栏：手机预览（375 真机宽度，不压窄）────────────────────────────── */
 .gzs-phonebox{width:100%;min-width:0;display:flex;justify-content:center}
-.gzs-phone{width:${PHONE_WIDTH}px;flex:0 0 auto;margin:0 auto;background:#fff;border-radius:16px;overflow:hidden;
-  box-shadow:0 12px 32px #17362a24,0 1px 0 #ffffff inset;border:1px solid var(--gzs-line)}
-.gzs-phonebar{height:28px;display:flex;align-items:center;justify-content:center;gap:6px;
-  font-size:10px;letter-spacing:.08em;color:var(--gzs-muted);background:var(--gzs-card2);
-  border-bottom:1px solid var(--gzs-line2)}
+/* 屏是纸的一部分：圆角小、无边框、无投影。它不该长得像一台独立的设备。
+   （原来屏内那行「375px · 微信正文预览」已经删掉：那是工程参数，
+   印在读者画面里等于给读者看我们的调试信息。说明改到纸外做 caption。） */
+.gzs-phone{width:${PHONE_WIDTH}px;flex:0 0 auto;margin:0 auto;background:#fff;overflow:hidden;border-radius:6px}
+.gzs-phonecap{margin-top:10px;font-size:10.5px;letter-spacing:.08em;color:var(--gzs-faint)}
+/* 空稿：给「读者会看到什么」的形状，而不是一张纯白 */
+.gzs-pskel{margin-top:16px}
+.gzs-pskel i{display:block;height:10px;border-radius:4px;background:var(--gzs-line2);margin:0 0 10px}
+.gzs-pskel i:nth-child(1){width:100%}
+.gzs-pskel i:nth-child(2){width:92%}
+.gzs-pskel i:nth-child(3){width:64%}
+.gzs-pskel__note{margin-top:16px;font-size:11px;line-height:1.6;color:var(--gzs-faint);text-align:center}
 .gzs-paper{padding:${PHONE_PAD}px;font-size:15px;line-height:1.85;color:#2d2d2d}
 /* 预览即编辑：正文块可点（点一下右栏就选中这段），图片悬停出「重出 / 换版」。
    这两件事以前要去右栏或「图」tab 里做，是每天最多余的两次切换。 */
 .gzs-psec{cursor:pointer;border-radius:6px;transition:background .12s,box-shadow .12s;padding:2px 4px;margin:0 -4px}
 .gzs-psec:hover{background:#4a91690f;box-shadow:0 0 0 1px #4a91692e}
-.gzs-psec--on{background:#4a916914}
+.gzs-psec--on{background:#4a916914;box-shadow:inset 3px 0 0 var(--gzs-teal)}
 .gzs-pimg{position:relative;cursor:pointer}
 .gzs-pimg__bar{position:absolute;right:8px;top:8px;display:flex;align-items:center;gap:4px;
   opacity:0;transition:opacity .12s;pointer-events:none}
@@ -602,21 +693,85 @@ window.__ModuleLoader__.load({
 .gzs-thumb{width:100%;display:block;border-radius:8px;background:var(--gzs-paper2)}
 .gzs-mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;color:var(--gzs-faint)}
 
-/* ── 右栏检查器：4 个 tab（意见 / 证据 / 图 / 元信息）──────────────────── */
+/* ── 右栏检查器：页签（本段 / 图 / 证据 / 元信息）──────────────────────── */
 .gzs-insp{display:flex;flex-direction:column;min-height:0}
 .gzs-insphead{display:flex;align-items:center;gap:8px;padding:12px 14px 9px;margin:0;
   font-family:var(--gzs-serif);font-size:13.5px;font-weight:700;color:var(--gzs-ink)}
+
+/* 「当前工作上下文」：抄历史工作台右栏顶上那块。用户 2026-11-09 的原话是
+   「新媒体工作台的右侧，你参考历史工作台的样子改进下」——他要的是**一眼看清
+   这篇在哪条线、第几段、卡在哪**，而不是先读到一串卡片。 */
+.gzs-ctx{margin:0 14px 10px;padding:10px 12px;border:1px solid var(--gzs-line);border-radius:10px;
+  background:var(--gzs-tint2)}
+.gzs-ctx__hd{display:flex;align-items:center;gap:7px;margin:0 0 6px;
+  font-family:var(--gzs-serif);font-size:12.5px;font-weight:700;color:var(--gzs-ink)}
+.gzs-ctx__grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px 14px;
+  font-size:11.5px;line-height:1.65;color:var(--gzs-muted)}
+.gzs-ctx__grid b{color:var(--gzs-body);font-weight:600}
+.gzs-ctx__note{margin-top:7px;font-size:11px;line-height:1.6;color:var(--gzs-faint)}
+
+/* 页签上的计数：0 不显示（历史工作台也是这个口径——「事件 0」占着一格只是噪音） */
+.gzs-itab__n{margin-left:5px;font-size:10.5px;color:var(--gzs-faint);font-variant-numeric:tabular-nums}
+.gzs-itab--on .gzs-itab__n{color:var(--gzs-teal)}
+
 .gzs-itabs{display:flex;gap:2px;padding:0 12px;border-bottom:1px solid var(--gzs-line);
   background:var(--gzs-card);flex:0 0 auto}
 .gzs-itab{border:0;border-bottom:2px solid transparent;background:transparent;font:inherit;font-size:12.5px;
-  color:var(--gzs-muted);padding:7px 10px 8px;cursor:pointer}
+  color:var(--gzs-muted);padding:7px 10px 8px;cursor:pointer;white-space:nowrap}
 .gzs-itab:hover{color:var(--gzs-teal)}
 .gzs-itab--on{color:var(--gzs-teal);border-bottom-color:var(--gzs-teal);font-weight:600}
 .gzs-itabpanel{padding:12px 14px 34px}
 .gzs-itabpanel[hidden]{display:none!important}
+
+/* 本段页：小标题 + 三个规格行 + 「本段原文」引文块。
+   引文块刻意和正文预览区分开（左侧竖线 + 浅底），一眼看出那是「原文照抄」，
+   而不是又一个可编辑的正文框。 */
+.gzs-sech{font-family:var(--gzs-serif);font-size:14.5px;font-weight:650;line-height:1.42;
+  color:var(--gzs-ink);margin:0 0 9px;letter-spacing:.2px}
 .gzs-kv{display:grid;grid-template-columns:76px minmax(0,1fr);gap:6px 10px;font-size:12.5px;margin:0}
 .gzs-kv dt{color:var(--gzs-faint)}
 .gzs-kv dd{margin:0;color:var(--gzs-body);word-break:break-word}
+.gzs-quote{margin:0;padding:9px 11px;border-radius:9px;background:var(--gzs-tint2);
+  border-left:2px solid var(--gzs-teal);font-size:12.5px;line-height:1.78;color:var(--gzs-body);
+  white-space:pre-wrap;word-break:break-word;max-height:340px;overflow:auto}
+.gzs-quote--empty{color:var(--gzs-faint);font-style:italic;border-left-color:var(--gzs-line)}
+/* 整篇页里的「各段小标题」清单：只是索引，不可点（点了也不会跳，别给假按钮） */
+.gzs-outline{margin:0;padding-left:18px;font-size:12.5px;line-height:1.85;color:var(--gzs-body)}
+.gzs-outline li{margin:0 0 1px}
+
+/* ── 右栏「图」页签：看图，不出图 ─────────────────────────────────────────
+   口径照历史工作台：缩略图 → 大图 → 规格行。出图控件在「元信息」，
+   这样「图」这一页永远是「现在长什么样」，不会被按钮和输入项搅成生成台。 */
+.gzs-galleryhead{display:flex;align-items:center;gap:8px;margin:0 0 8px;
+  font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--gzs-muted)}
+.gzs-gallery{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px;margin:0 0 12px}
+.gzs-gallery__slot{position:relative;padding:0;border:1px solid var(--gzs-line);border-radius:7px;
+  overflow:hidden;background:var(--gzs-paper2);cursor:pointer;display:block;aspect-ratio:16/10}
+.gzs-gallery__slot--on{border-color:var(--gzs-teal);box-shadow:0 0 0 2px var(--gzs-tint)}
+.gzs-gallery__slot img{width:100%;height:100%;object-fit:cover;display:block}
+.gzs-gallery__gap{display:flex;align-items:center;justify-content:center;height:100%;
+  font-size:10.5px;color:var(--gzs-faint)}
+.gzs-gallery__cap{position:absolute;left:0;right:0;bottom:0;padding:1px 5px;font-size:9.5px;
+  color:#fff;background:linear-gradient(to top,rgba(18,32,24,.72),rgba(18,32,24,0));text-align:left}
+.gzs-bigpic{border:1px solid var(--gzs-line);border-radius:10px;overflow:hidden;background:var(--gzs-paper2)}
+.gzs-bigpic img{width:100%;display:block}
+/* 规格行：左列标签、右列值 */
+.gzs-lines2{display:grid;grid-template-columns:auto minmax(0,1fr);gap:3px 10px;
+  font-size:11.5px;line-height:1.65;margin:0}
+.gzs-lines2 span:nth-child(odd){color:var(--gzs-faint);white-space:nowrap}
+.gzs-lines2 span:nth-child(even){color:var(--gzs-body);word-break:break-word}
+
+/* 折叠区（出图控件收在这里，默认收起）：看图页打开来只有图 */
+.gzs-collapse{margin-top:14px;border-top:1px solid var(--gzs-line2);padding-top:10px}
+.gzs-collapse__hd{display:flex;align-items:center;gap:6px;width:100%;padding:4px 0;border:0;
+  background:transparent;font:inherit;font-size:11.5px;color:var(--gzs-muted);cursor:pointer;
+  text-align:left}
+.gzs-collapse__hd:hover{color:var(--gzs-teal)}
+.gzs-collapse__hd--on{color:var(--gzs-teal);font-weight:600}
+.gzs-collapse__mark{font-size:9px;width:10px}
+.gzs-collapse__body{padding:8px 0 0}
+/* 页签下方的固定动作（删这一篇 / 删这一段）：不属于任何一页，所以压在页签外 */
+.gzs-inspfoot{padding:10px 14px 16px;border-top:1px solid var(--gzs-line2)}
 .gzs-thumbs{display:grid;grid-template-columns:1fr 1fr;gap:9px}
 .gzs-thumbs figure{margin:0;cursor:pointer}
 .gzs-thumbs img{width:100%;height:74px;object-fit:cover;border-radius:7px;border:1px solid var(--gzs-line);
@@ -788,6 +943,11 @@ window.__ModuleLoader__.load({
 .gzs-homecols{display:grid;grid-template-columns:minmax(0,1fr) 306px;gap:20px;align-items:start}
 .gzs-homecols--solo{grid-template-columns:minmax(0,1fr)}
 @media (max-width:1240px){.gzs-homecols{grid-template-columns:1fr}}
+/* 宽屏（≥1500）把卡片摊成多列：一行一张卡在 1600 宽的面板里是「一张卡横着一条」，
+   右边半屏空着。不是卡片太大，是没吃下多出来的宽度。 */
+@media (min-width:1500px){
+  .gzs-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:10px;align-items:start}
+}
 .gzs-actpanel{position:sticky;top:0}
 .gzs-actbody{padding:6px 8px 8px}
 .gzs-actlist{display:flex;flex-direction:column}
@@ -808,7 +968,6 @@ window.__ModuleLoader__.load({
 /* 徽标压在封面上：半透明墨绿底 + 浅字，深图浅图都能读 */
 .gzs-card__life{padding:0 5px;border-radius:4px;font-weight:650;font-size:9.5px}
 .gzs-card__life--draft{background:var(--gzs-paper2);color:var(--gzs-muted)}
-.gzs-card__life--draftbox{background:var(--gzs-warn-soft);color:var(--gzs-warn)}
 .gzs-card__life--published{background:var(--gzs-ok-soft);color:var(--gzs-ok)}
 /* 赛道：比生命周期轻一档——它是「按哪套口径写」，不是「到哪一步了」 */
 .gzs-card__track{padding:0 5px;border-radius:4px;font-size:9.5px;font-weight:600;
@@ -1041,32 +1200,48 @@ window.__ModuleLoader__.load({
 .gzs-drawer .gzs-repo{margin-top:0}
 .gzs-drawer .gzs-repo__body{max-height:none}
 
-/* ── 弹窗（推草稿 / 以后别的确认）──────────────────────────────────────────── */
+/* ── 「步骤」抽屉：做一篇稿 / 一条视频要过的步子 ────────────────────────────
+   以前「≡ 步骤」只是把中间那根左栏收起又展开，而首页（没有左栏）里点了**什么都不会发生**——
+   用户的原话是「我点步骤，步骤没有显示出来」。步骤是内容怎么从零到发的过程，
+   跟「哪一栏开着」是两件事，所以它现在是一个能随时打开的抽屉。 */
+.gzs-stepsb{display:flex;flex-direction:column;gap:14px}
+.gzs-stepsb__line{border:1px solid var(--gzs-line);border-radius:10px;background:var(--gzs-card);padding:12px 14px 8px}
+.gzs-stepsb__head{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:4px}
+.gzs-stepsb__t{font-family:var(--gzs-serif);font-size:14px;font-weight:700;color:var(--gzs-ink)}
+.gzs-stepsb__meta{font-size:10.5px;color:var(--gzs-faint)}
+.gzs-stepsb__p{margin:0 0 8px;font-size:11.5px;line-height:1.7;color:var(--gzs-muted)}
+.gzs-stepsb__row{display:grid;grid-template-columns:26px minmax(0,1fr) auto;gap:9px;align-items:baseline;
+  padding:6px 2px;border-top:1px solid var(--gzs-line2)}
+.gzs-stepsb__row:first-of-type{border-top:0}
+/* 可点的步骤行：诊断和处方放在同一行，点一下就去办 */
+.gzs-stepsb__row--act{width:100%;border:0;border-top:1px solid var(--gzs-line2);background:transparent;
+  font:inherit;color:inherit;text-align:left;cursor:pointer;border-radius:0}
+.gzs-stepsb__row--act:first-of-type{border-top:0}
+.gzs-stepsb__row--act:hover{background:var(--gzs-tint2)}
+.gzs-stepsb__row--act:hover .gzs-stepsb__name{color:var(--gzs-teal)}
+.gzs-stepsb__no{font-family:var(--gzs-mono,ui-monospace);font-size:10.5px;color:var(--gzs-faint);
+  font-variant-numeric:tabular-nums}
+.gzs-stepsb__name{font-size:12px;color:var(--gzs-ink);font-weight:600;min-width:0}
+.gzs-stepsb__note{display:block;font-size:10.5px;line-height:1.6;color:var(--gzs-muted);font-weight:400;margin-top:1px}
+.gzs-stepsb__v{font-size:11px;color:var(--gzs-muted);white-space:nowrap;text-align:right}
+.gzs-stepsb__v--ok{color:var(--gzs-ok);font-weight:650}
+.gzs-stepsb__v--doing{color:var(--gzs-warn)}
+.gzs-stepsb__v--miss{color:var(--gzs-err)}
+.gzs-stepsb__acts{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px}
+.gzssplit{height:1px;background:var(--gzs-line2);margin:0}
+
+/* ── 角色条：哪边说话、哪边看板 ─────────────────────────────────────────────
+   对话收起之后，面板看起来像一个「点了没反应的编辑器」：输入框没了，
+   按钮全是只读的。这条把它说清楚，并给一键把对话打开的出口。 */
+.gzs-rolebar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;flex:0 0 auto;
+  padding:7px 14px;border-bottom:1px solid var(--gzs-line2);background:var(--gzs-tint2);
+  font-size:11px;line-height:1.5;color:var(--gzs-muted)}
+.gzs-rolebar b{color:var(--gzs-teal);font-weight:700}
+.gzs-rolebar .gzs-spacer{flex:1}
+
+/* ── 弹窗（检查等一次性确认）──────────────────────────────────────────────── */
 .gzs-modal{position:absolute;inset:0;z-index:50;display:flex;align-items:center;justify-content:center;
   padding:26px;background:#17362a33;animation:gzs-fade .14s ease-out}
-/* 发布包：一稿多投。每行一个平台：规格 → 检查 → 复制。 */
-.gzs-pack{padding:16px 18px 24px;display:flex;flex-direction:column;gap:12px}
-.gzs-pack__note{line-height:1.7}
-.gzs-pack__row{border:1px solid var(--gzs-line2);border-radius:10px;padding:11px 13px;
-  background:var(--gzs-card);display:flex;flex-direction:column;gap:7px}
-.gzs-pack__head{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
-.gzs-pack__name{font-family:var(--gzs-serif);font-size:14px;font-weight:700;color:var(--gzs-ink)}
-.gzs-pack__spec{font-size:10.5px;color:var(--gzs-muted)}
-.gzs-pack__mode{margin-left:auto;font-size:10px;padding:1px 6px;border-radius:5px;
-  background:var(--gzs-tint);color:var(--gzs-teal)}
-.gzs-pack__meta{display:flex;gap:14px;font-size:11px;color:var(--gzs-muted);font-variant-numeric:tabular-nums}
-.gzs-pack__warn{color:var(--gzs-warn);font-weight:650}
-.gzs-pack__title{font-size:12.5px;color:var(--gzs-ink);line-height:1.6;white-space:pre-wrap}
-.gzs-pack__in{width:100%;padding:5px 8px;font:inherit;font-size:11.5px;color:var(--gzs-ink);
-  background:var(--gzs-card2);border:1px solid var(--gzs-line2);border-radius:7px;outline:none}
-.gzs-pack__in:focus{border-color:var(--gzs-teal)}
-.gzs-pack__area{width:100%;padding:6px 8px;font:inherit;font-size:11.5px;line-height:1.65;color:var(--gzs-ink);
-  background:var(--gzs-card2);border:1px solid var(--gzs-line2);border-radius:7px;outline:none;resize:vertical}
-.gzs-pack__area:focus{border-color:var(--gzs-teal)}
-.gzs-pack__checks{margin:0;padding-left:16px;display:flex;flex-direction:column;gap:3px}
-.gzs-pack__check{font-size:11px;line-height:1.6;color:var(--gzs-warn)}
-.gzs-pack__acts{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
-.gzs-pack__foot{line-height:1.7;border-top:1px dashed var(--gzs-line2);padding-top:10px}
 
 .gzs-modal__card{width:min(560px,96%);max-height:88%;display:flex;flex-direction:column;
   background:var(--gzs-card);border:1px solid var(--gzs-line);border-radius:12px;overflow:hidden;
@@ -1082,21 +1257,8 @@ window.__ModuleLoader__.load({
 .gzs-modal__foot{display:flex;gap:8px;justify-content:flex-end;padding:11px 14px;
   border-top:1px solid var(--gzs-line2);background:var(--gzs-card2)}
 
-/* 推草稿：自查结果与错误码都要能一眼读完、能复制 */
-.gzs-push__lead{font-size:12px;line-height:1.75;color:var(--gzs-body);margin:0 0 12px}
-.gzs-push__lead code{font-size:11px;background:var(--gzs-paper2);border-radius:4px;padding:1px 4px}
 .gzs-push__field{display:block;margin:0 0 10px}
 .gzs-push__k{display:block;font-size:10.5px;font-weight:600;letter-spacing:.06em;color:var(--gzs-muted);margin:0 0 4px}
-.gzs-push__row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:11.5px;color:var(--gzs-body);
-  padding:8px 10px;border:1px solid var(--gzs-line2);border-radius:8px;background:var(--gzs-card2);margin:0 0 10px}
-.gzs-push__stat{display:flex;gap:12px;flex-wrap:wrap;font-size:11.5px;color:var(--gzs-body);margin:0 0 10px}
-.gzs-push__stat b{color:var(--gzs-ink);font-variant-numeric:tabular-nums}
-.gzs-push__prob{margin:0 0 8px;padding:8px 10px;border-radius:8px;
-  background:var(--gzs-err-soft);color:var(--gzs-err);font-size:11.5px;line-height:1.7}
-.gzs-push__ok{padding:9px 11px;border-radius:8px;background:var(--gzs-ok-soft);color:var(--gzs-ink);
-  font-size:12px;line-height:1.7}
-.gzs-push__ip{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:4px;
-  font-family:ui-monospace,Consolas,monospace;font-size:11.5px}
 
 /* ── 顶栏内容线切换（公众号 / 视频号）────────────────────────────────────── */
 .gzs-chan{display:inline-flex;gap:1px;padding:2px;border:1px solid var(--gzs-line);
@@ -1106,6 +1268,10 @@ window.__ModuleLoader__.load({
 .gzs-chan__b:hover{color:var(--gzs-ink)}
 .gzs-chan__b--on{background:var(--gzs-card);color:var(--gzs-teal);font-weight:600;
   box-shadow:0 1px 2px #17362a14}
+/* 未接真源仓库的小圆点：视频号那栏**常驻**了，所以「有没有接上」得有个记号，
+   否则点进去才发现是空的——那正是上一版把它藏起来想避免的事。 */
+.gzs-chan__dot{display:inline-block;width:5px;height:5px;border-radius:50%;margin-left:4px;
+  vertical-align:middle;background:var(--gzs-warn);opacity:.85}
 
 /* ── 左栏原生对话（会话内嵌，由宿主渲染 conversation.content）──────────────── */
 .gzs-root--split{flex-direction:row}
@@ -1122,7 +1288,11 @@ window.__ModuleLoader__.load({
    下面留一大片空白（输入框浮在中间）。grid 的行高直接把那个孙节点撑满。 */
 .gzs-chatnote{margin:auto;padding:22px 20px;font-size:11.5px;line-height:1.8;color:var(--gzs-muted);text-align:center;max-width:280px}
 .gzs-chatcol__bar{flex:0 0 auto;display:flex;align-items:center;gap:6px;padding:6px 8px 6px 10px;
-  border-bottom:1px solid var(--gzs-line2);background:var(--gzs-card2)}
+  flex-wrap:wrap;row-gap:4px;border-bottom:1px solid var(--gzs-line2);background:var(--gzs-card2)}
+/* 工作区选择器：内嵌对话的 cwd 必须落在宿主认得的某个工作区上。
+   落在别处时输入框只会写「选择一个工作区开始」——那是死路，点哪都没有输入框。 */
+.gzs-chatws{flex:0 0 auto;max-width:160px;padding:2px 4px;border:1px solid var(--gzs-line);border-radius:5px;
+  background:var(--gzs-card);color:var(--gzs-body);font:inherit;font-size:10px;cursor:pointer}
 .gzs-chatcol__t{font-size:10.5px;font-weight:700;letter-spacing:.04em;color:var(--gzs-teal)}
 .gzs-chatcol__s{flex:1;min-width:0;font-size:10px;color:var(--gzs-faint);
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -1140,9 +1310,37 @@ window.__ModuleLoader__.load({
 .gzs-chattoggle:hover{color:var(--gzs-teal);border-color:var(--gzs-teal)}
 .gzs-chattoggle.is-on{color:var(--gzs-teal);background:var(--gzs-tint);border-color:var(--gzs-teal)}
 
+/* ── 批量出图的进度条 ─────────────────────────────────────────────────────── */
+.gzs-batchbar{flex:0 0 auto;display:flex;align-items:center;gap:9px;flex-wrap:wrap;
+  padding:6px 14px;border-bottom:1px solid var(--gzs-line2);background:var(--gzs-tint2);font-size:11px;color:var(--gzs-body)}
+.gzs-batchbar__k{font-weight:700;color:var(--gzs-teal)}
+.gzs-batchbar__v{font-variant-numeric:tabular-nums;color:var(--gzs-muted)}
+.gzs-batchbar__bar{flex:1 1 140px;height:5px;border-radius:3px;background:var(--gzs-line2);overflow:hidden;min-width:90px}
+.gzs-batchbar__bar i{display:block;height:100%;background:var(--gzs-teal);transition:width .25s ease-out}
+
+/* ── 右栏：只读看板的一行 ──────────────────────────────────────────────────
+   口径（2026-11-07 用户明确）：**右栏是看板，只看**。改标题、改正文、调 prompt
+   都在左栏对话里做。所以右栏里不该出现能打字的东西——出现一次，口径就塌了。 */
+.gzs-inspnote{margin:0 0 10px;padding:8px 10px;border-radius:8px;background:var(--gzs-tint2);
+  border:1px dashed var(--gzs-ok-line);font-size:10.5px;line-height:1.6;color:var(--gzs-muted)}
+.gzs-ro{margin:0 0 9px}
+.gzs-ro__k{display:flex;align-items:center;gap:6px;font-size:10px;font-weight:700;letter-spacing:.06em;
+  color:var(--gzs-faint);text-transform:uppercase;margin-bottom:3px}
+.gzs-ro__k .gzs-btn{margin-left:auto;padding:1px 6px;font-size:10px}
+.gzs-ro__v{font-size:12px;line-height:1.7;color:var(--gzs-body);white-space:pre-wrap;word-break:break-word}
+.gzs-ro__v--empty{color:var(--gzs-faint);font-style:italic}
+.gzs-ro__v--box{max-height:190px;overflow:auto;padding:6px 8px;border:1px solid var(--gzs-line2);
+  border-radius:6px;background:var(--gzs-card2)}
+
 /* ── 主区容器（工作台在里面；对话列由工作台自己排）────────────────────────── */
-.gzs-main{display:flex;flex-direction:column;height:100%;min-height:0}
-.gzs-main__body{flex:1;min-height:0;display:flex}
+/* ⚠ 宽度要**吃满**宿主给的这一栏。
+   .gzs-main__body 是 flex 行容器，.gzs-root 作为它的子项 flex-basis 是 auto：
+   宽度只按内容的 max-content 算，也不会 grow。窄窗口看不出来（放不下就被压回来），
+   但 2560 这种宽屏下右边会空出七八百像素——用户的原话是「右侧什么都没有，很浪费」。
+   那不是配色问题，是面板根本没占满。三处一起给：main 宽、body 允许收缩、root 长。 */
+.gzs-main{display:flex;flex-direction:column;height:100%;min-height:0;width:100%;min-width:0;flex:1 1 auto}
+.gzs-main__body{flex:1;min-height:0;min-width:0;display:flex}
+.gzs-main__body>.gzs-root{flex:1 1 auto;min-width:0;max-width:none}
 
 /* ── 视频号看板（只读）───────────────────────────────────────────────────── */
 .gzs-vboard{display:flex;flex-direction:column;min-height:0;flex:1;overflow:auto;padding:18px 22px 40px}
@@ -1170,6 +1368,18 @@ window.__ModuleLoader__.load({
 .gzs-vempty__actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:5px}
 .gzs-vempty__steps{display:flex;gap:5px;flex-wrap:wrap;margin-top:4px}
 .gzs-vempty__steps span{font-size:10.5px;color:var(--gzs-muted);border:1px solid var(--gzs-line);border-radius:999px;padding:2px 7px;background:var(--gzs-card)}
+
+/* 「视频目录未配置」的两条路：有素材（指目录）/ 没素材（建目录）。
+   做成有序列表而不是一段大段落：用户要挑一条走，不是读一篇说明。 */
+.gzs-vhint-strong{font-size:12px;color:var(--gzs-ink);margin:10px 0 6px}
+.gzs-setup{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:10px}
+.gzs-setup li{border:1px solid var(--gzs-line);border-radius:8px;padding:10px 12px;background:var(--gzs-card)}
+.gzs-setup__t{font-size:12px;font-weight:650;color:var(--gzs-ink)}
+.gzs-setup__d{font-size:11.5px;line-height:1.7;color:var(--gzs-muted);margin-top:3px}
+.gzs-setup__pick{margin-top:8px;display:flex;flex-direction:column;gap:6px}
+.gzs-setup__msg{font-size:11.5px;line-height:1.7;margin-top:10px;padding:7px 10px;border-radius:6px}
+.gzs-setup__msg--ok{color:var(--gzs-ink);background:var(--gzs-okbg, rgba(31,160,120,0.10));border:1px solid rgba(31,160,120,0.35)}
+.gzs-setup__msg--error{color:var(--gzs-ink);background:rgba(214,69,69,0.10);border:1px solid rgba(214,69,69,0.38)}
 .gzs-vrows{display:flex;flex-direction:column;gap:7px;margin-top:12px}
 .gzs-vrow{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;gap:12px;align-items:center;
   padding:11px 14px;border:1px solid var(--gzs-line2);border-radius:10px;background:var(--gzs-card);
@@ -1257,18 +1467,42 @@ window.__ModuleLoader__.load({
 .gzs-vpack .gzs-push__field{margin:0}
 .gzs-vpack .gzs-hint{margin:0}
 
-/* ── 首启向导：空库时最该回答的是「三步怎么开始」──────────────────────────── */
-.gzs-firstrun{margin:14px 0 0;padding:14px 16px;border:1px solid var(--gzs-ok-line);border-radius:12px;
+/* ── 首屏（空库）：不教配置，只给一句话和一个入口 ─────────────────────────── */
+.gzs-welcome{margin:14px 0 0;padding:18px 20px 16px;border:1px solid var(--gzs-ok-line);border-radius:12px;
   background:linear-gradient(180deg,var(--gzs-card) 0%,var(--gzs-card2) 100%)}
-.gzs-firstrun__h{font-family:var(--gzs-serif);font-size:15px;font-weight:700;color:var(--gzs-ink);margin-bottom:10px}
-.gzs-firstrun__steps{display:flex;flex-direction:column;gap:8px}
-.gzs-firstrun__step{display:flex;align-items:center;gap:11px;padding:9px 11px;border:1px solid var(--gzs-line2);
-  border-radius:9px;background:var(--gzs-card)}
-.gzs-firstrun__no{flex:0 0 auto;width:20px;height:20px;border-radius:50%;display:flex;align-items:center;
-  justify-content:center;background:var(--gzs-tint);color:var(--gzs-teal);font-size:11px;font-weight:700}
-.gzs-firstrun__body{flex:1;min-width:0}
-.gzs-firstrun__t{font-size:12.5px;font-weight:650;color:var(--gzs-ink)}
-.gzs-firstrun__d{font-size:11px;line-height:1.6;color:var(--gzs-muted);margin-top:2px}
+.gzs-welcome__lead{font-family:var(--gzs-serif);font-size:16px;font-weight:700;color:var(--gzs-ink);letter-spacing:.2px}
+.gzs-welcome__sub{font-size:11.5px;line-height:1.75;color:var(--gzs-muted);margin-top:5px;max-width:52em}
+.gzs-welcome__seed{display:flex;gap:8px;align-items:stretch;margin-top:12px}
+.gzs-welcome__seed .gzs-area{flex:1;min-width:0}
+.gzs-welcome__chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:9px}
+.gzs-welcome__alt{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:14px;
+  padding-top:12px;border-top:1px dashed var(--gzs-line2)}
+.gzs-welcome__more{margin-top:10px}
+.gzs-welcome__rows{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px}
+/* ① 左栏说 ② 右栏看 ③ 接着说：分工写在最前面，比事后解释「为什么点不动」便宜得多 */
+.gzs-welcome__flow{display:flex;flex-wrap:wrap;gap:8px;margin-top:11px}
+.gzs-welcome__flow span{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:999px;
+  border:1px solid var(--gzs-ok-line);background:var(--gzs-tint2);font-size:11px;line-height:1.5;color:var(--gzs-muted)}
+.gzs-welcome__flow b{color:var(--gzs-teal);font-weight:700}
+.gzs-welcome__alert{display:flex;flex-direction:column;gap:3px;margin-top:11px;padding:9px 12px;
+  border:1px solid var(--gzs-warn-line);border-radius:9px;background:var(--gzs-warn-soft);
+  font-size:11.5px;line-height:1.65;color:var(--gzs-body)}
+.gzs-welcome__alert b{color:var(--gzs-warn);font-size:12px}
+
+/* ── 内置示例稿：只读整屏 ──────────────────────────────────────────────────── */
+.gzs-example{display:flex;flex-direction:column;gap:12px;min-height:0;height:100%}
+.gzs-example__head{display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:10px 12px;
+  border:1px solid var(--gzs-ok-line);border-radius:10px;background:var(--gzs-tint)}
+.gzs-example__badge{flex:0 0 auto;font-size:11px;font-weight:650;color:var(--gzs-teal);
+  border:1px solid var(--gzs-ok-line);border-radius:999px;padding:1px 8px;background:var(--gzs-card)}
+.gzs-example__body{display:flex;gap:18px;align-items:flex-start;min-height:0;overflow:auto}
+.gzs-example__phone{flex:0 0 auto}
+.gzs-example__side{flex:1;min-width:0;display:flex;flex-direction:column;gap:10px}
+.gzs-example__block{border:1px solid var(--gzs-line2);border-radius:10px;padding:10px 12px;background:var(--gzs-card)}
+.gzs-example__k{font-size:11.5px;font-weight:650;color:var(--gzs-ink);margin-bottom:6px}
+.gzs-example__row{display:flex;gap:8px;align-items:flex-start;font-size:11.5px;line-height:1.65;
+  color:var(--gzs-muted);padding:3px 0}
+.gzs-example__t{flex:0 0 auto;font-variant-numeric:tabular-nums;opacity:.75}
 
 /* ── 新建表单 ───────────────────────────────────────────────────────────── */
 .gzs-formwrap{max-width:660px;margin:0 auto}
@@ -1426,13 +1660,13 @@ window.__ModuleLoader__.load({
      * 保证面板上看的是人话、而拿得到的东西仍是原词。
      */
     const STATUS_TEXT = {
-      ready: { text: "可推草稿", level: "ok" },
+      ready: { text: "可导出", level: "ok" },
       "needs-published-inventory": { text: "缺人物清单", level: "warn" },
       "needs-research": { text: "缺证据台账", level: "err" },
       "needs-browser-audit": { text: "待重新核验", level: "warn" },
       "needs-user-approval": { text: "待你确认", level: "warn" },
       "needs-video-cover": { text: "缺合规封面", level: "warn" },
-      "needs-draft-approval": { text: "待授权推草稿", level: "warn" },
+      "needs-draft-approval": { text: "待排版留痕", level: "warn" },
       "needs-review": { text: "需人看一眼", level: "warn" },
       "dry-run": { text: "仅模拟回执", level: "warn" },
     };
@@ -1552,14 +1786,10 @@ window.__ModuleLoader__.load({
      * 未绑定时不假装有状态，只给一个绑定期号的入口。
      */
     function PipeBlock({
-      pipeline: pipe, busy, onRefresh, onBind, root, hasBody, onOpenObs,
+      pipeline: pipe, busy, onRefresh, hasBody, onOpenObs,
       // 未绑定时的粗略进度用这几样：标题、有没有封面、还缺几张配图、导出过没有
       articleTitle, hasCover, imageGaps, roughProgress,
     }) {
-      const [adv, setAdv] = React.useState(false);
-      const [episode, setEpisode] = React.useState(pipe?.episodeId ?? "");
-      const [dir, setDir] = React.useState(pipe?.root ?? root ?? "");
-      React.useEffect(() => { setEpisode(pipe?.episodeId ?? ""); setDir(pipe?.root ?? root ?? ""); }, [pipe?.episodeId, pipe?.root, root]);
 
       const head = h("div", { className: "gzs-sect__head", style: { marginBottom: 7 } },
         h("span", null, "流水线"),
@@ -1574,7 +1804,6 @@ window.__ModuleLoader__.load({
        * 小白不会懂「期号」和「根目录」——他写一篇文章不需要先填绝对路径。
        * 所以这里按**内容完整度**推五档：有标题 → 有正文 → 有封面 → 配图齐 → 导出过。
        * 这不是流水线的「第几步」，所以**明确标注「粗略估计」**，别让人误以为是精确判定。
-       * 绑期号降级成「进阶：接上产线」的折叠项，愿意用的人再用。
        */
       if (!pipe?.bound) {
         const rough = roughProgress ?? {};
@@ -1596,19 +1825,12 @@ window.__ModuleLoader__.load({
               h("span", { className: "gzs-step__mark" }, x.done ? "✓" : String(i + 1)),
               h("span", null, x.label)))),
           h("div", { className: "gzs-hint", style: { marginTop: 8 } },
-            `完成 ${doneCount}/${steps.length} 档。想看精确的「卡在哪一道门」，可以接上产线（进阶，需要填期号）。`),
-          h("div", { className: "gzs-row", style: { marginTop: 6 } },
-            h("div", { className: "gzs-spacer" }),
-            h(Btn, { small: true, kind: "ghost", on: () => setAdv((v) => !v) }, adv ? "收起进阶" : "接上产线")),
-          adv
-            ? h("div", { style: { marginTop: 8 } },
-              h(Field, { label: "期号（如 historical-person-027）" },
-                h(TextInput, { value: episode, placeholder: "historical-person-027", onCommit: setEpisode })),
-              h(Field, { label: "流水线根目录" },
-                h(TextInput, { value: dir, placeholder: "D:/work/历史内容生产", onCommit: setDir })),
-              h("div", { className: "gzs-row", style: { marginTop: 4 } },
-                h(Btn, { kind: "primary", small: true, on: () => onBind({ episodeId: episode.trim(), root: dir.trim() }), disabled: busy || !episode.trim() || !dir.trim() }, "绑定")))
-            : null);
+            `完成 ${doneCount}/${steps.length} 档。这是按稿件估的——这篇没挂到期号上，所以门禁判不出「卡在哪一道门」。`),
+          // 「接上产线」那张表（期号 + 绝对路径）2026-11-08 删掉：
+          // 它要用户填两个只有自己知道的字符串，而「期号 / 产线 / 真源仓库」对外人就是黑话。
+          // 挂期号改由 Agent 在对话里做（它知道仓库在哪）；面板只负责说清「现在这个是估的」。
+          h("div", { className: "gzs-hint", style: { marginTop: 2 } },
+            "要精确的门禁结论，在左栏说一句「这篇挂到第 N 期」让 Agent 去绑。"));
       }
 
       const label = STATUS_TEXT[pipe.status] ?? { text: pipe.status || "状态未知", level: "warn" };
@@ -1657,21 +1879,41 @@ window.__ModuleLoader__.load({
      */
     function TextInput({ value, placeholder, onCommit, rows, mark }) {
       const [draft, setDraft] = React.useState(value ?? "");
-      // 外部值变了（切槽位 / 别的操作刷新）时同步回来；否则输入框会一直显示上一段的字
-      React.useEffect(() => { setDraft(value ?? ""); }, [value]);
-      const commit = () => { if ((draft ?? "") !== (value ?? "")) onCommit(draft); };
+      /**
+       * 外部刷新**不许**盖掉正在打的字。
+       *
+       * SSE 每隔几秒就推一次全量状态，`value` 因此会变；但用户可能正在这个框里写第 3 段，
+       * 每推一次就 `setDraft(value)` 等于把敲到一半的字按回上一次落盘的版本——
+       * 人只会看到光标跳回开头、刚打的字没了，还以为自己按错了键。
+       * 所以「聚焦中」或「本地改过还没提交」时跳过同步；失焦/提交后解除，外部值才能再进来。
+       * 用 ref 不用 state：这两个标记只决定要不要同步，改它们不该触发重渲染。
+       */
+      const focused = React.useRef(false);
+      const dirty = React.useRef(false);
+      React.useEffect(() => {
+        if (focused.current || dirty.current) return;
+        setDraft(value ?? "");
+      }, [value]);
+      const commit = () => {
+        // 先清标记再提交：提交成功后外部值就是刚写下去的那份，下次刷新同步回来正好一致
+        dirty.current = false;
+        if ((draft ?? "") !== (value ?? "")) onCommit(draft);
+      };
+      const type = (next) => { dirty.current = true; setDraft(next); };
+      const onFocus = () => { focused.current = true; };
+      const onBlur = () => { focused.current = false; commit(); };
       // `mark` 落到 data 属性上，给「按语义取某个输入框」用（见 promptOnScreen）。
       // 按位置取（第一个 textarea）会取错——正文框排在 prompt 框前面。
       const attrs = mark ? { "data-mark": mark } : {};
       if (rows) {
         return h("textarea", {
           className: "gzs-area", rows, value: draft, placeholder: placeholder ?? "",
-          onChange: (e) => setDraft(e.target.value), onBlur: commit, ...attrs,
+          onChange: (e) => type(e.target.value), onFocus, onBlur, ...attrs,
         });
       }
       return h("input", {
         className: "gzs-input", value: draft, placeholder: placeholder ?? "",
-        onChange: (e) => setDraft(e.target.value), onBlur: commit,
+        onChange: (e) => type(e.target.value), onFocus, onBlur,
         onKeyDown: (e) => { if (e.key === "Enter") { e.preventDefault(); commit(); e.target.blur?.(); } },
         ...attrs,
       });
@@ -1706,7 +1948,9 @@ window.__ModuleLoader__.load({
         const fit = () => {
           const width = el.clientWidth;
           if (!width) return;
-          const next = Math.min(1, Math.max(0.62, Number((width / (PHONE_WIDTH + 4)).toFixed(3))));
+          // 除数是**真机宽度本身**：以前除的是 375+4，于是容器正好 375 时算出 0.989，
+          // 每次进来都无声地缩 1%，而条上还写着「375px」。等于宽度时就不该缩。
+          const next = Math.min(1, Math.max(0.62, Number((width / PHONE_WIDTH).toFixed(3))));
           setZoom((prev) => (Math.abs(prev - next) < 0.01 ? prev : next));
         };
         fit();
@@ -1778,6 +2022,15 @@ window.__ModuleLoader__.load({
       }
       blocks.push(h("div", { key: "rule0", style: { height: 1, background: t.rule ?? "#eee", margin: "0 0 18px" } }));
 
+      
+
+      // 选中哪一段，预览就滚到哪一段：看的是「这一段在手机上什么位置」。
+      React.useEffect(() => {
+        if (!selected) return;
+        const node = boxRef.current?.querySelector?.(`[data-slot="${selected}"]`);
+        try { node?.scrollIntoView?.({ block: "nearest", behavior: "smooth" }); } catch { /* 不支持就算了，不挡事 */ }
+      }, [selected]);
+
       // 空段落（没小标题、没正文、没配图）在读者眼里就是不存在的一段，整段跳过。
       // 不跳的话它会在正文最末尾留一个「第 N 段还没有配图 · 点这里出图」的虚线框——
       // 那是编辑器控件，混在读者视角的预览里像是文章没写完。QA 仍然会报「第 N 段没有正文」。
@@ -1789,6 +2042,15 @@ window.__ModuleLoader__.load({
           || paragraphsOf(section.body).length
           || currentVersion(section.image)
         ));
+
+      // 空稿：给「读者会看到什么」的形状。纯白卡片既没有信息也没有引导，
+      // 视觉重心落在最没内容的地方。占位条 + 一句话，比空白诚实。
+      if (!visibleSections.length && !coverVersion && !String(article.summary ?? "").trim()) {
+        blocks.push(h("div", { key: "skel", className: "gzs-pskel" },
+          h("i"), h("i"), h("i")));
+        blocks.push(h("div", { key: "skelnote", className: "gzs-pskel__note" },
+          "写完第一段，这里就是读者看到的样子"));
+      }
 
       visibleSections.forEach(({ section, index }, position) => {
         const slot = `sec-${section.id}`;
@@ -1857,8 +2119,9 @@ window.__ModuleLoader__.load({
         blocks.push(h("div", {
           key: `sec-${section.id}`,
           className: `gzs-psec${selected === slot ? " gzs-psec--on" : ""}`,
+          "data-slot": slot,
           style: ring(slot) ?? null,
-          title: "点一下：在右栏编辑这一段",
+          title: "点一下：右栏切到这一段",
           onClick: pick(slot),
         }, inner));
         if (position < visibleSections.length - 1) {
@@ -1868,7 +2131,6 @@ window.__ModuleLoader__.load({
 
       return h("div", { className: "gzs-phonebox", ref: boxRef },
         h("div", { className: "gzs-phone", style: zoom === 1 ? null : { zoom } },
-          h("div", { className: "gzs-phonebar" }, `${PHONE_WIDTH}px · 微信正文预览`),
           h("div", { className: "gzs-paper", style: { background: t.bg ?? "#fff" } }, blocks)));
     }
 
@@ -2120,11 +2382,9 @@ window.__ModuleLoader__.load({
 
       // 8 排版校验 / 9 摘要推草稿 / 10 自我迭代：没有判据就老实标未开始
       set(8, { state: "todo", verdict: "未开始", detail: "没有排版校验的留痕" });
-      set(9, life === "draftbox"
-        ? { state: "ok", verdict: "已进草稿箱", detail: "生命周期是人工标的" }
-        : life === "published"
-          ? { state: "ok", verdict: "已发布", detail: "生命周期是人工标的" }
-          : { state: "todo", verdict: "未开始", detail: "还没有草稿箱/发布记录" });
+      set(9, life === "published"
+        ? { state: "ok", verdict: "已发布", detail: "生命周期是人工标的" }
+        : { state: "todo", verdict: "未开始", detail: "还没有发布记录" });
       set(10, { state: "todo", verdict: "发布后", detail: "发布之后才有复盘可做", target: "" });
 
       return {
@@ -2149,15 +2409,8 @@ window.__ModuleLoader__.load({
      * 未绑期号时**不留空白**：十一步照列，状态按稿件推断，并在标题下明写「按稿件推断 · 未绑定期号」。
      * 一根空步骤条会被当成面板坏了。
      */
-    function StepRail({ view, article, selected, onSelect, onAddSection, onBind, busy, root }) {
-      const [bindOpen, setBindOpen] = React.useState(false);
+    function StepRail({ view, article, selected, onSelect, onAddSection, busy }) {
       const [structureOpen, setStructureOpen] = React.useState(true);
-      const [episode, setEpisode] = React.useState(view?.pipeline?.episodeId ?? "");
-      const [dir, setDir] = React.useState(view?.pipeline?.root ?? root ?? "");
-      React.useEffect(() => {
-        setEpisode(view?.pipeline?.episodeId ?? "");
-        setDir(view?.pipeline?.root ?? root ?? "");
-      }, [view?.pipeline?.episodeId, view?.pipeline?.root, root]);
 
       const steps = inferSteps(view);
       const pipeline = view?.pipeline ?? null;
@@ -2183,14 +2436,13 @@ window.__ModuleLoader__.load({
             steps.bound ? headNote : `这篇还没绑定期号 · ${steps.done}/${steps.total} 步有据`)),
         steps.bound
           ? null
-          // 未绑期号：说明与「接上产线」同一行——单独一行按钮会把 11 步挤出半行滚动。
+          // 未绑期号就只说清「这是估的」。原来这里还有一颗「接上产线」——它后面是
+          // 一张要人填期号与绝对路径的表，2026-11-08 删了（挂期号改由 Agent 在对话里做）。
           : h("div", { className: "gzs-railnote" },
             h("span", {
               className: "gzs-railnote__text",
               title: "推算依据：标题/受众/正文/配图/提案/账本/审阅清单，不是盘上门禁的结论",
-            }, headNote),
-            h(Btn, { small: true, kind: "ghost", on: () => setBindOpen((value) => !value) },
-              bindOpen ? "收起" : "接上产线")),
+            }, headNote)),
 
         h("div", { className: "gzs-stepsbar" },
           steps.rows.map((row) => {
@@ -2214,22 +2466,6 @@ window.__ModuleLoader__.load({
               h("span", { className: `gzs-steptag gzs-steptag--${row.state}` }, row.verdict));
           })),
 
-        // 绑定表单展开时才占位（按钮已经在上面那行了）
-        bindOpen
-          ? h("div", { className: "gzs-railbind" },
-            h(Field, { label: "期号" },
-              h(TextInput, { value: episode, placeholder: "historical-person-027", onCommit: setEpisode })),
-            h(Field, { label: "流水线根目录" },
-              h(TextInput, { value: dir, placeholder: "D:/work/历史内容生产", onCommit: setDir })),
-            h(Btn, {
-              small: true, kind: "primary",
-              disabled: Boolean(busy) || !String(episode).trim() || !String(dir).trim(),
-              on: () => onBind?.({ episodeId: String(episode).trim(), root: String(dir).trim() }),
-            }, "绑定"),
-            h("div", { className: "gzs-hint", style: { marginTop: 6 } },
-              "绑上之后这一栏换成盘上门禁的真结论。"))
-          : null,
-
         h("div", { className: "gzs-railfoot" },
           h("button", { className: "gzs-railfoot__head", onClick: () => setStructureOpen((value) => !value) },
             h("span", null, "结构"),
@@ -2239,6 +2475,89 @@ window.__ModuleLoader__.load({
           structureOpen
             ? h(Outline, { article, selected, onSelect, onAddSection })
             : null));
+    }
+
+    /**
+     * 「步骤」抽屉：这个工作台到底按什么顺序把一件内容做出来。
+     *
+     * 以前「≡ 步骤」只是左栏的开关。问题是那个左栏只在**单篇视图**里存在：
+     * 首页（以及空库首屏）上点它什么都不会发生——用户的原话是「我点步骤，
+     * 步骤没有显示出来」。步骤回答的是「从零到发布要过哪几关、我卡在哪」，
+     * 跟「哪一栏开着」是两件事，所以它现在是一个随时能打开的抽屉。
+     *
+     * 两条线分开列，判据不混：
+     * - 公众号：11 步。绑了期号就是盘上门禁的结论，没绑就按稿件推断（标题/正文/
+     *   配图/提案/账本/审阅清单），推出来的那句「按稿件推断」照实写在标题下面；
+     * - 视频号：8 步，判据是盘上有没有那件文件（大纲/口播稿/分镜/配音/分段/字幕/
+     *   封面/成片）。某一期具体缺哪几步，去视频号看板点开那一期看。
+     *
+     * 抽屉里**不放生成动作**：写稿、出图、配音都在对话里做，面板只报进度。
+     *
+     * 但「只报进度」不等于每行只能看（0.3.1 冒烟后改）：有落点的行点了直接跳过去
+     * （`onStep`），没有落点的行（证据台账这类）点了会把一句带定位的话**填进左栏对话**，
+     * 人只要按回车。诊断和处方放在同一行，比「先看诊断、再自己组织语言去问」少两步。
+     */
+    function StepsBoard({ view, article, videoConfigured = false, onJump, onCreate, onGoChat, onGoVideo, onStep }) {
+      const steps = inferSteps(view);
+      const rows = Array.isArray(steps.rows) ? steps.rows : [];
+      const bound = Boolean(steps.bound);
+      const done = Number(steps.done) || 0;
+      const total = Number(steps.total) || rows.length || 0;
+
+      const articleLine = h("div", { className: "gzs-stepsb__line" },
+        h("div", { className: "gzs-stepsb__head" },
+          h("span", { className: "gzs-stepsb__t" }, "公众号 · 一篇稿"),
+          h("span", { className: "gzs-stepsb__meta" },
+            bound
+              ? `门禁结论 · ${done}/${total} 已过`
+              : (article?.id ? `按稿件推断 · ${done}/${total} 步有据` : "还没有稿")),
+          h("div", { className: "gzs-spacer" }),
+          onJump && article?.id
+            ? h(Btn, { small: true, kind: "ghost", on: onJump }, "打开这篇")
+            : null,
+          onGoChat
+            ? h(Btn, { small: true, kind: "ghost", on: onGoChat }, "去对话说一句")
+            : null),
+        h("p", { className: "gzs-stepsb__p" },
+          "从建稿到能发，一共过这几关。面板只显示走到哪一步；改稿、出图、改排版都在左侧对话里说。"),
+        rows.map((row) => {
+          const act = typeof onStep === "function";
+          const Row = act ? "button" : "div";
+          return h(Row, {
+            key: row.key,
+            className: `gzs-stepsb__row${act ? " gzs-stepsb__row--act" : ""}`,
+            title: act
+              ? (row.target ? "打开这一步所在的稿/段落" : "把这一句带进左栏对话，让它先补这一步")
+              : undefined,
+            onClick: act ? () => onStep(row) : undefined,
+          },
+            h("span", { className: "gzs-stepsb__no" }, String(row.no).padStart(2, "0")),
+            h("span", { className: "gzs-stepsb__name" }, row.label,
+              row.detail ? h("span", { className: "gzs-stepsb__note" }, row.detail) : null),
+            h("span", { className: `gzs-stepsb__v gzs-stepsb__v--${row.state}` }, row.verdict || STEP_WORD[row.state] || ""));
+        }),
+        !article?.id
+          ? h("div", { className: "gzs-stepsb__acts" },
+            onCreate ? h(Btn, { small: true, kind: "primary", on: onCreate }, "＋ 新建一篇") : null,
+            h("span", { className: "gzs-hint" }, "还没有稿时，第 0 步以前都是「未开始」——先建一篇，或者在对话里说一句让它建。"))
+          : null);
+
+      const videoLine = h("div", { className: "gzs-stepsb__line" },
+        h("div", { className: "gzs-stepsb__head" },
+          h("span", { className: "gzs-stepsb__t" }, "视频号 · 一期片"),
+          h("span", { className: "gzs-stepsb__meta" }, videoConfigured ? "读视频期目录" : "还没指定期目录"),
+          h("div", { className: "gzs-spacer" }),
+          onGoVideo ? h(Btn, { small: true, kind: "ghost", on: onGoVideo }, "看视频号看板") : null),
+        h("p", { className: "gzs-stepsb__p" },
+          videoConfigured
+            ? "八步都在盘上有判据：有那件文件就算过。某一期具体缺哪几步，去视频号看板点开那一期。"
+            : "期目录在「视频号」页里指定：有素材就指到已有目录，没有就让插件建一个。没指定之前这一栏只列步骤、不显示期。"),
+        VIDEO_STEPS.map((step, index) => h("div", { key: step.key, className: "gzs-stepsb__row" },
+          h("span", { className: "gzs-stepsb__no" }, String(index + 1).padStart(2, "0")),
+          h("span", { className: "gzs-stepsb__name" }, step.label),
+          h("span", { className: "gzs-stepsb__v" }, videoConfigured ? "按盘判" : "还没配目录"))));
+
+      return h("div", { className: "gzs-stepsb" }, articleLine, videoLine);
     }
 
     // ── 中栏：正文舞台（成稿 / 手机预览 / 排版）──────────────────────────────
@@ -2319,9 +2638,29 @@ window.__ModuleLoader__.load({
       });
 
       if (!blocks.length) {
-        return h("div", { className: "gzs-empty" }, h("div", null, "这篇还是空的"), h("div", { className: "gzs-hint" }, "先在右栏「元信息」里写标题，再逐段写正文"));
+        return h("div", { className: "gzs-empty" }, h("div", null, "这篇还是空的"), h("div", { className: "gzs-hint" }, "在左侧对话里说一句，让它先把标题和第一段写出来；右栏只读，要改哪一项就点那一行的「让 Agent 改」"));
       }
       return h("div", { className: "gzs-doc" }, blocks);
+    }
+
+    /**
+     * 手机预览那一列：**工具条在壳外，壳只包屏幕**。
+     *
+     * 踩过（0.3.9 之前的「并排」）：这一列直接渲染 `ExportBar + PhonePreview`，
+     * 手机壳（`.gzs-phonewrap`）只写在「手机预览」分支里，于是同一个预览在两种视图里
+     * 长得不一样——并排时是一张浮在角落的白纸，手机预览时才是台手机。
+     * 更糟的是列宽由工具条（三个按钮）决定：`.gzs-phonebox{width:100%}` 拿到 352，
+     * JS 就按 `352/379` 把 375 的预览缩到 0.93，而条上还印着「375px」。
+     *
+     * 现在两种视图共用这一个组件：壳固定 397（375 + 两侧 11），列宽也跟着固定，
+     * 工具条只能换行、不能反过来把手机挤小。
+     */
+    function PhonePane({ article, templates, selected, onSelect, onRegenerate, onPickVersion, busy }) {
+      return h("div", { className: "gzs-phonepane" },
+        h("div", { className: "gzs-phonewrap" },
+          h(PhonePreview, { article, templates, selected, onSelect, busy, onRegenerate, onPickVersion })),
+        // 说明放在纸**外**：纸里只该有读者会看到的东西
+        h("div", { className: "gzs-phonecap" }, `阅读视图 · ${PHONE_WIDTH}`));
     }
 
     /**
@@ -2331,572 +2670,32 @@ window.__ModuleLoader__.load({
      * 原来的做法是把手机预览当排版看，但那看不出「粘到公众号后台会是什么样」。
      */
     /**
-     * 导出工具条（原「排版」视图 2026-11-02 按用户指令去掉，入口不能跟着消失）。
+     * 导出菜单：HTML / Markdown / 图片清单。
      *
-     * 一条横排：导出 HTML / Markdown / 图片清单 + 当前排版件的来源与哈希。
-     * 排版看哪里？看「手机预览」；要发出去的那份 HTML，导出的就是它。
+     * 以前这是三个按钮压在手机预览头顶（旁边还挂一句「还没有排版件」）。那是**文章级**动作，
+     * 却占着预览的第一眼，还和「看手机上什么样」抢注意力。收成 meta 行右端一颗「导出 ▾」。
      */
-    function ExportBar({ article, onExport }) {
+    function ExportMenu({ article, onExport }) {
       if (!article) return null;
       const meta = article.layoutMeta && typeof article.layoutMeta === "object" ? article.layoutMeta : null;
-      return h("div", { className: "gzs-layoutacts" },
-        h(Btn, { kind: "primary", on: () => onExport?.("html") }, "导出 HTML"),
-        h(Btn, { on: () => onExport?.("md") }, "Markdown"),
-        h(Btn, { on: () => onExport?.("checklist") }, "图片清单"),
-        meta
-          ? h("span", { className: "gzs-hint", style: { margin: "0 0 0 10px" } },
+      const close = (event) => { try { event?.currentTarget?.closest?.("details")?.removeAttribute?.("open"); } catch { /* 关不掉也不影响导出 */ } };
+      const pick = (format) => (event) => { close(event); onExport?.(format); };
+      return h("details", { className: "gzs-export" },
+        h("summary", { className: "gzs-btn gzs-btn--sm", title: "导出这篇：HTML / Markdown / 图片清单" }, "导出 ▾"),
+        h("div", { className: "gzs-export__menu" },
+          h(Btn, { small: true, kind: "primary", on: pick("html") }, "HTML（粘公众号后台）"),
+          h(Btn, { small: true, on: pick("md") }, "Markdown"),
+          h(Btn, { small: true, on: pick("checklist") }, "图片清单"),
+          meta
+            ? h("span", { className: "gzs-hint" },
               `排版件 ${String(meta.sha256 ?? "").slice(0, 12)}${meta.generatedAt ? " · " + meta.generatedAt : ""}`)
-          : h("span", { className: "gzs-hint", style: { margin: "0 0 0 10px" } }, "还没有排版件"));
+            : h("span", { className: "gzs-hint" }, "还没有排版件")));
     }
 
-    /**
-     * 「上次推过」提示：防止同一篇反复建草稿。
-     *
-     * 推草稿是**新建**不是覆盖——同一个号里连点两次就是两条草稿。
-     * 所以把上一次回执摆出来（时间 + media_id），并写清「再推会多一条」，而不是拦着不让推。
-     */
-    function LastPublishNotice({ lastPublish }) {
-      if (!lastPublish) return null;
-      return h("div", { className: "gzs-push__row" },
-        h("span", null, "上次推过：", h("b", null, ago(lastPublish.ts)), "（media_id ",
-          h("code", { className: "gzs-mono" }, String(lastPublish.mediaId ?? "—")), "）"),
-        h("span", { className: "gzs-hint" }, "再推一次会新建一条草稿，不会覆盖上一条。"));
-    }
+    
 
-    // ── 多平台：平台档案 / 规格检查 / 发布包 ─────────────────────────────────
-    /**
-     * 平台档案（spec）。
-     *
-     * 纪律：**只把确定的值当硬指标**。公众号的 32 / 128 / 2 万是官方文档值；
-     * 小红书、抖音、快手的字数与比例按公开资料给默认值，标「参考」——
-     * 平台规则会变，用户也不该因为我们的参考值被拦。所以检查一律是提醒，不拦复制、不拦发布。
-     *
-     * 发布方式三种：`draft`（有草稿接口，能真推）、`package`（只能出包复制）、`manual`（人工）。
-     */
     /** 「没选内容类型」的筛选哨兵：与宿主 `TRACK_NONE` 同值（空串是「不筛」，含义相反）。 */
     const TRACK_NONE = "__none";
-
-    const PLATFORM_SPECS = [
-      {
-        id: "wechat", name: "公众号", titleMax: 32, bodyMax: 20_000,
-        coverRatio: "2.35:1", ratio: 2.35, links: true,
-        publish: "draft", note: "官方文档值；能直接推草稿",
-      },
-      {
-        id: "xhs", name: "小红书", titleMax: 20, bodyMax: 1_000,
-        coverRatio: "3:4", ratio: 0.75, links: false,
-        publish: "package", note: "参考值；没有公开发布接口，复制后到 App / 创作中心发",
-      },
-      {
-        id: "douyin", name: "抖音", titleMax: 55, bodyMax: 1_000,
-        coverRatio: "3:4", ratio: 0.75, links: false,
-        publish: "package", note: "参考值；图文按笔记发，正式发布需企业开发者资质",
-      },
-      {
-        id: "kuaishou", name: "快手", titleMax: 55, bodyMax: 1_000,
-        coverRatio: "3:4", ratio: 0.75, links: false,
-        publish: "package", note: "参考值；同抖音，先出包复制",
-      },
-    ];
-
-    const platformSpec = (id) => PLATFORM_SPECS.find((spec) => spec.id === id) ?? PLATFORM_SPECS[0];
-
-    /** 正文纯文本：小标题 + 段落，空行分隔。平台包里用这个，不用带样式。 */
-    function plainArticleBody(article) {
-      const parts = [];
-      for (const section of Array.isArray(article?.sections) ? article.sections : []) {
-        const head = String(section?.heading ?? "").trim();
-        const body = paragraphsOf(section?.body).map((text) => String(text).trim()).filter(Boolean).join("\n\n");
-        if (!head && !body) continue;
-        parts.push([head ? `【${head}】` : "", body].filter(Boolean).join("\n\n"));
-      }
-      return parts.join("\n\n");
-    }
-
-    /** 截到上限；尽量在标点处断，断不了就硬截。 */
-    function fitText(text, max) {
-      const value = String(text ?? "");
-      if (value.length <= max) return { text: value, cut: false };
-      const slice = value.slice(0, max);
-      const lastStop = Math.max(...["。", "！", "？", "；", ".", "!", "?", ";", "，", ","].map((mark) => slice.lastIndexOf(mark)));
-      const keep = lastStop > max * 0.6 ? slice.slice(0, lastStop + 1) : slice;
-      return { text: keep, cut: true };
-    }
-
-    /** 这篇在某平台上存过的版本（没有就是 null）。 */
-    function savedTarget(article, platformId) {
-      const list = Array.isArray(article?.targets) ? article.targets : [];
-      return list.find((item) => item && item.platform === platformId) ?? null;
-    }
-
-    /**
-     * 一份平台包的规格分析：截断 / 检查 / 可复制文本。
-     *
-     * 对话框里的实时预览和「复制」必须走同一个函数——两处各算一遍，
-     * 迟早出现「检查说超了、复制出来却没超」这种自相矛盾。
-     */
-    function analyzePack(spec, rawTitle, rawBody, coverVersion, hashtags = []) {
-      const titleText = String(rawTitle ?? "").trim();
-      const bodyText = String(rawBody ?? "");
-      const title = fitText(titleText, spec.titleMax);
-      const body = fitText(bodyText, spec.bodyMax);
-      const checks = [];
-      if (titleText.length > spec.titleMax) {
-        checks.push({
-          id: "title", level: "warn",
-          message: `标题 ${titleText.length}/${spec.titleMax} 字，发出去会被截断：复制时已截到「${title.text}」`,
-        });
-      }
-      if (bodyText.length > spec.bodyMax) {
-        checks.push({
-          id: "body", level: "warn",
-          message: `正文 ${bodyText.length}/${spec.bodyMax} 字，超出 ${bodyText.length - spec.bodyMax} 字`,
-        });
-      }
-      if (!spec.links && /https?:\/\//i.test(bodyText)) {
-        checks.push({ id: "link", level: "warn", message: "这个平台正文里的外链不可点，建议删掉或改写成「见评论区 / 主页」" });
-      }
-      if (coverVersion?.width && coverVersion?.height) {
-        const ratio = coverVersion.width / coverVersion.height;
-        if (Math.abs(ratio - spec.ratio) > 0.08) {
-          checks.push({
-            id: "cover", level: "warn",
-            message: `封面 ${coverVersion.width}×${coverVersion.height}（${ratio.toFixed(2)}:1），${spec.name}建议 ${spec.coverRatio}，会被裁切`,
-          });
-        }
-      }
-      const tags = (Array.isArray(hashtags) ? hashtags : []).filter(Boolean);
-      return {
-        spec,
-        title: title.text,
-        body: body.text,
-        hashtags: tags,
-        titleCut: title.cut,
-        bodyCut: body.cut,
-        titleLen: titleText.length,
-        bodyLen: bodyText.length,
-        checks,
-        copyText: [title.text, body.text, tags.map((tag) => (tag.startsWith("#") ? tag : `#${tag}`)).join(" ")]
-          .filter(Boolean)
-          .join("\n\n"),
-      };
-    }
-
-    /**
-     * 出一份平台包：**存过的平台版本 → 原稿**。
-     *
-     * 原稿是唯一真源，平台版本是它的投影；存过就说明用户按这个平台裁过，
-     * 检查和复制都该以那一版为准。
-     */
-    function platformPack(article, platformId) {
-      const spec = platformSpec(platformId);
-      const saved = savedTarget(article, platformId);
-      const rawTitle = String(saved?.title || article?.title || "");
-      const rawBody = String(saved?.body || plainArticleBody(article));
-      const pack = analyzePack(spec, rawTitle, rawBody, currentVersion(article?.cover), saved?.hashtags ?? []);
-      return { ...pack, saved: Boolean(saved) };
-    }
-
-    /**
-     * 从编辑框里的草稿生成 `targets`：**只存和原稿不一样的部分**。
-     *
-     * 不这么做的话，一次「全部保存」会把整篇正文复制成四五份塞进 article.json——
-     * 既撑大文件，又让「原稿改了、平台版还是旧的」变成看不见的不一致。
-     * 和原稿相同 = 不存 = 永远跟着原稿走。
-     */
-    function targetsFromDraft(article, draft = {}) {
-      const baseTitle = String(article?.title ?? "").trim();
-      const baseBody = plainArticleBody(article);
-      const targets = [];
-      for (const spec of PLATFORM_SPECS) {
-        const item = draft?.[spec.id] ?? {};
-        const title = String(item.title ?? "").trim();
-        const body = String(item.body ?? "").trim();
-        const hashtags = String(item.hashtags ?? "")
-          .split(/[\s,，]+/)
-          .map((tag) => tag.trim())
-          .filter(Boolean);
-        const entry = { platform: spec.id };
-        if (title && title !== baseTitle) entry.title = title;
-        if (body && body !== baseBody) entry.body = body;
-        if (hashtags.length) entry.hashtags = hashtags;
-        if (entry.title || entry.body || entry.hashtags) targets.push(entry);
-      }
-      return targets;
-    }
-
-    /** 复制到剪贴板：优先 Clipboard API，被权限挡住就退回选中文本框。 */
-    async function copyToClipboard(text) {
-      const value = String(text ?? "");
-      try {
-        if (navigator?.clipboard?.writeText) {
-          await navigator.clipboard.writeText(value);
-          return true;
-        }
-      } catch { /* 落到下面的兜底 */ }
-      try {
-        const area = document.createElement("textarea");
-        area.value = value;
-        area.style.position = "fixed";
-        area.style.opacity = "0";
-        document.body.appendChild(area);
-        area.select();
-        const ok = document.execCommand("copy");
-        document.body.removeChild(area);
-        return ok;
-      } catch {
-        return false;
-      }
-    }
-
-    /**
-     * 发布包：一稿多投的出口。
-     *
-     * 每行一个平台：可改的标题 / 正文 / 话题 + 规格检查 + 复制。
-     * 保存时只写「和原稿不一样的那部分」（targets）——原稿仍是唯一真源，
-     * 平台版本只是它的投影；不存的话，下次打开还是按原稿自动裁。
-     */
-    function PublishPackDialog({ article, onClose, onPush, onSave }) {
-      const baseTitle = String(article?.title ?? "").trim();
-      const baseBody = plainArticleBody(article);
-      const [draft, setDraft] = React.useState(() => {
-        const out = {};
-        for (const spec of PLATFORM_SPECS) {
-          const saved = savedTarget(article, spec.id);
-          out[spec.id] = {
-            title: saved?.title ?? "",
-            body: saved?.body ?? "",
-            hashtags: Array.isArray(saved?.hashtags) ? saved.hashtags.join(" ") : "",
-          };
-        }
-        return out;
-      });
-      const [flash, setFlash] = React.useState("");
-      // 和「检查」「往期」一样：Esc 能退出去。少了这个键，弹窗就成了「只能找按钮」。
-      React.useEffect(() => {
-        const onKey = (event) => { if (event?.key === "Escape") onClose?.(); };
-        window.addEventListener?.("keydown", onKey);
-        return () => window.removeEventListener?.("keydown", onKey);
-      }, [onClose]);
-      const patch = (id, key, value) => setDraft((prev) => ({ ...prev, [id]: { ...(prev[id] ?? {}), [key]: value } }));
-      const grab = async (text, key) => {
-        const ok = await copyToClipboard(text);
-        setFlash(ok ? key : `fail:${key}`);
-      };
-      const save = () => {
-        onSave?.(targetsFromDraft(article, draft));
-        setFlash("saved");
-      };
-      const title = baseTitle || "（还没标题）";
-      return h("div", {
-        className: "gzs-modal",
-        onClick: (event) => { if (event.target === event.currentTarget) onClose?.(); },
-      },
-        h("div", { className: "gzs-modal__card gzs-modal__card--wide", role: "dialog", "aria-label": "发布包" },
-          h("div", { className: "gzs-modal__bar" },
-            h("span", { className: "gzs-modal__t" }, "发布包 · 一稿多投"),
-            h("span", { className: "gzs-hint" }, title),
-            h("div", { className: "gzs-spacer" }),
-            flash === "saved" ? h("span", { className: "gzs-hint" }, "已保存到这一篇") : null,
-            h(Btn, { small: true, kind: "primary", on: save, disabled: !onSave }, "保存平台版本"),
-            h("button", { className: "gzs-chatcol__x", onClick: () => onClose?.(), title: "关闭" }, "×")),
-          h("div", { className: "gzs-modal__body gzs-modal__body--flush" },
-            h("div", { className: "gzs-pack" },
-              h("div", { className: "gzs-hint gzs-pack__note" },
-                "同一个稿子，按各平台规格裁一遍。标题 / 正文留空＝用原稿；改了才存，和原稿一样的不占空间。"),
-              PLATFORM_SPECS.map((spec) => {
-                const item = draft[spec.id] ?? {};
-                const saved = savedTarget(article, spec.id);
-                const packs = analyzePack(
-                  spec,
-                  String(item.title ?? "").trim() || baseTitle,
-                  String(item.body ?? "").trim() || baseBody,
-                  currentVersion(article?.cover),
-                  String(item.hashtags ?? "").split(/[\s,，]+/).filter(Boolean),
-                );
-                return h("div", { key: spec.id, className: "gzs-pack__row" },
-                  h("div", { className: "gzs-pack__head" },
-                    h("span", { className: "gzs-pack__name" }, spec.name),
-                    h("span", { className: "gzs-pack__spec" }, `标题 ≤${spec.titleMax} · 正文 ≤${spec.bodyMax} · 封面 ${spec.coverRatio}`),
-                    saved ? h("span", { className: "gzs-pack__mode" }, "已存平台版") : null,
-                    h("span", { className: "gzs-pack__mode" }, spec.publish === "draft" ? "可直推草稿" : "出包复制")),
-                  h("input", {
-                    className: "gzs-pack__in",
-                    value: item.title ?? "",
-                    placeholder: `标题：留空＝用原标题（${baseTitle.slice(0, 14)}${baseTitle.length > 14 ? "…" : ""}）`,
-                    onChange: (event) => patch(spec.id, "title", event.target.value),
-                  }),
-                  h("textarea", {
-                    className: "gzs-pack__area",
-                    rows: 3,
-                    value: item.body ?? "",
-                    placeholder: "正文：留空＝用原稿正文",
-                    onChange: (event) => patch(spec.id, "body", event.target.value),
-                  }),
-                  h("input", {
-                    className: "gzs-pack__in",
-                    value: item.hashtags ?? "",
-                    placeholder: "话题：空格分隔（可选）",
-                    onChange: (event) => patch(spec.id, "hashtags", event.target.value),
-                  }),
-                  h("div", { className: "gzs-pack__meta" },
-                    h("span", { className: packs.titleCut ? "gzs-pack__warn" : "" }, `标题 ${packs.titleLen}/${spec.titleMax}`),
-                    h("span", { className: packs.bodyCut ? "gzs-pack__warn" : "" }, `正文 ${packs.bodyLen}/${spec.bodyMax}`),
-                    h("span", null, `封面 ${spec.coverRatio}`)),
-                  packs.checks.length
-                    ? h("ul", { className: "gzs-pack__checks" },
-                      packs.checks.map((check) => h("li", { key: check.id, className: "gzs-pack__check" }, check.message)))
-                    : h("div", { className: "gzs-hint" }, "没有发现规格问题。"),
-                  h("div", { className: "gzs-pack__acts" },
-                    h(Btn, { small: true, on: () => grab(packs.copyText, spec.id) }, flash === spec.id ? "已复制" : "复制标题+正文"),
-                    h(Btn, {
-                      small: true, kind: "ghost",
-                      on: () => grab([packs.title, packs.checks.map((c) => `· ${c.message}`).join("\n")].join("\n\n"), `${spec.id}-title`),
-                    }, flash === `${spec.id}-title` ? "已复制" : "只复制标题"),
-                    spec.publish === "draft" && onPush
-                      ? h(Btn, { small: true, kind: "primary", on: onPush }, "去推草稿")
-                      : null,
-                    flash === `fail:${spec.id}`
-                      ? h("span", { className: "gzs-hint" }, "浏览器挡住了剪贴板，手动选中再复制")
-                      : null));
-              }),
-              h("div", { className: "gzs-hint gzs-pack__foot" },
-                "小红书没有公开的发布接口；抖音 / 快手要企业开发者资质。所以这里是「发布包」，不是「一键发布」——只有公众号那条能直接进草稿箱。")))));
-    }
-
-    /**
-     * 推草稿对话框。
-     *
-     * 一次只回答一个问题：「现在能不能推、还差什么」。所以它有两个形态：
-     * - 没配公众号 → 配置向导（AppID / AppSecret / 作者 / 直连或网关）；
-     * - 配好了 → 推前自查（字符数、图片数、限额问题）+ 推 + 回执。
-     *
-     * 不用系统 alert：`40164` 的出口 IP 必须能一键复制，弹窗做不到这件事。
-     * 也**不假装能发布**：推的是草稿，群发/发表仍然人工在后台点。
-     */
-    function PushDialog({ id, onClose, onDone, lastPublish }) {
-      const [status, setStatus] = React.useState(null);
-      const [statusError, setStatusError] = React.useState("");
-      const [editing, setEditing] = React.useState(false);
-      const [check, setCheck] = React.useState({ loading: false, error: null, data: null });
-      const [busy, setBusy] = React.useState(false);
-      const [result, setResult] = React.useState(null);
-      const [copied, setCopied] = React.useState("");
-      const [form, setForm] = React.useState({ appId: "", appSecret: "", author: "", mode: "direct", gatewayURL: "", gatewayToken: "" });
-      const patchForm = (patch) => setForm((prev) => ({ ...prev, ...patch }));
-
-      const runCheck = async () => {
-        if (!id) return;
-        setCheck({ loading: true, error: null, data: null });
-        try {
-          const data = await postJson(ROUTES.push, { id, dryRun: true });
-          setCheck({ loading: false, error: null, data });
-        } catch (error) {
-          setCheck({ loading: false, error, data: null });
-        }
-      };
-
-      React.useEffect(() => {
-        let live = true;
-        (async () => {
-          try {
-            const data = await getJson(ROUTES.wechatStatus);
-            if (!live) return;
-            setStatus(data);
-            if (data?.configured || data?.usable) {
-              setCheck({ loading: true, error: null, data: null });
-              try {
-                const preview = await postJson(ROUTES.push, { id, dryRun: true });
-                if (live) setCheck({ loading: false, error: null, data: preview });
-              } catch (error) {
-                if (live) setCheck({ loading: false, error, data: null });
-              }
-            }
-          } catch (error) {
-            // 老宿主没有这条路由：说清「重启一次就好」，别让人以为插件坏了。
-            if (live) {
-              setStatusError(error?.status === 404
-                ? "宿主这一版还没加载推草稿路由：重启一次 dsh web 后就能用（会话记录在盘上，不会丢）。"
-                : error.message);
-            }
-          }
-        })();
-        return () => { live = false; };
-      }, [id]);
-
-      React.useEffect(() => {
-        const onKey = (event) => { if (event?.key === "Escape" && !busy) onClose?.(); };
-        window.addEventListener?.("keydown", onKey);
-        return () => window.removeEventListener?.("keydown", onKey);
-      }, [busy]);
-
-      const copy = (text, tag) => {
-        try {
-          navigator.clipboard?.writeText?.(String(text ?? ""));
-          setCopied(tag);
-          window.setTimeout(() => setCopied(""), 1600);
-        } catch { setCopied(""); }
-      };
-
-      const saveConfig = async () => {
-        setBusy(true);
-        try {
-          const data = await postJson(ROUTES.wechatConfig, wechatConfigPayload(form));
-          setStatus(data);
-          setStatusError("");
-          setEditing(false);
-          await runCheck();
-        } catch (error) {
-          setStatusError(error.message);
-        } finally {
-          setBusy(false);
-        }
-      };
-
-      const doPush = async () => {
-        setBusy(true);
-        setResult(null);
-        try {
-          const data = await postJson(ROUTES.push, { id });
-          setResult(data);
-          onDone?.();
-        } catch (error) {
-          setCheck((prev) => ({ ...prev, error }));
-        } finally {
-          setBusy(false);
-        }
-      };
-
-      const configured = Boolean(status && (status.configured || status.usable)) && !editing;
-      /**
-       * 进「改配置」：**留空的字段等于不改**，所以只回填能回填的（作者 / 模式 / 网关地址），
-       * AppID 与 AppSecret 故意留空——回填掩码会被当成新值存进去。
-       */
-      const startEditing = () => {
-        setForm((prev) => ({
-          ...prev,
-          appId: "",
-          appSecret: "",
-          author: status?.author ?? "",
-          mode: status?.mode === "gateway" ? "gateway" : "direct",
-          gatewayURL: status?.gateway?.baseURL ?? "",
-          gatewayToken: "",
-        }));
-        setEditing(true);
-      };
-      const problems = check.data?.problems ?? check.error?.problems ?? [];
-      const stats = check.data?.stats ?? null;
-      const images = check.data?.images ?? [];
-      const failure = check.error ?? null;
-
-      const field = (label, key, extra = {}) => h("label", { className: "gzs-push__field" },
-        h("span", { className: "gzs-push__k" }, label),
-        h("input", {
-          className: "gzs-input",
-          value: form[key],
-          onChange: (event) => patchForm({ [key]: event.target.value }),
-          ...extra,
-        }));
-
-      const configBody = h("div", null,
-        h("p", { className: "gzs-push__lead" },
-          "推草稿要用公众号的 AppID / AppSecret（公众号后台 → 设置与开发 → 基本配置）。",
-          h("br"),
-          "密钥只存在本机 ", h("code", null, "~/.dsh/gzh-studio/wechat.json"),
-          "，只会发给微信接口；不想落盘就用环境变量 GZH_WECHAT_APPID / GZH_WECHAT_SECRET。"),
-        field("AppID", "appId", { placeholder: status?.appId ? `已配置 ${status.appId}，留空不改` : "wx…", spellCheck: false }),
-        field("AppSecret", "appSecret", { placeholder: status?.hasSecret ? "已保存，留空不改" : "只在本机保存", type: "password", spellCheck: false }),
-        field("作者（可选，≤16 字）", "author", { placeholder: "显示在草稿里的作者名" }),
-        h("div", { className: "gzs-push__row" },
-          h("span", null, "推送方式"),
-          h("div", { className: "gzs-seg" },
-            [["direct", "直连微信"], ["gateway", "走网关"]].map(([key, label]) =>
-              h(Btn, {
-                key, small: true, kind: form.mode === key ? "primary" : "ghost",
-                on: () => patchForm({ mode: key }),
-              }, label))),
-          h("span", { className: "gzs-hint" }, form.mode === "direct" ? "插件直接调微信接口" : "插件只发任务，密钥留在网关")),
-        form.mode === "gateway" ? field("网关地址", "gatewayURL", { placeholder: "https://your-gateway.example" }) : null,
-        form.mode === "gateway" ? field("网关令牌", "gatewayToken", { type: "password" }) : null,
-        h("p", { className: "gzs-hint" },
-          "直连模式第一次推大概率遇到 40164：把微信报的出口 IP 加进「基本配置 → IP 白名单」即可，面板会把 IP 直接给你复制。"),
-        h("p", { className: "gzs-hint" }, "推的是「草稿」不是「发布」：群发 / 发表仍然要人工在公众号后台点。"),
-        statusError ? h("div", { className: "gzs-push__prob" }, statusError) : null);
-
-      const configuredBody = h("div", null,
-        h("div", { className: "gzs-push__row" },
-          h("span", null, "AppID ", h("b", null, status?.appId || "—")),
-          h("span", null, "作者 ", h("b", null, status?.author || "未填")),
-          h("span", null, status?.mode === "gateway" ? "网关模式" : "直连模式"),
-          h("div", { className: "gzs-spacer" }),
-          h(Btn, { small: true, kind: "ghost", on: startEditing }, "改配置")),
-        h(LastPublishNotice, { lastPublish }),
-        check.loading ? h("div", { className: "gzs-hint", style: { padding: "6px 0" } }, "自查中：数一遍字符和图片…") : null,
-        stats
-          ? h("div", { className: "gzs-push__stat" },
-            h("span", null, "正文 ", h("b", null, stats.contentChars.toLocaleString()), " 字符"),
-            h("span", null, "图片 ", h("b", null, String(images.length)), " 张"),
-            h("span", null, "标题 ", h("b", null, String(stats.title)), " 字"),
-            h("span", null, "摘要 ", h("b", null, String(stats.digest)), " 字"),
-            h("span", { className: "gzs-hint" }, "上限 2 万字符 / 1 MB"))
-          : null,
-        problems.length
-          ? h("div", { className: "gzs-push__prob" },
-            problems.map((problem, index) => h("div", { key: index }, `· ${problem.message}`)))
-          : null,
-        failure
-          ? h("div", { className: "gzs-push__prob" },
-            h("div", null, failure.message),
-            failure.hint ? h("div", { className: "gzs-hint" }, failure.hint) : null,
-            failure.ip
-              ? h("div", { className: "gzs-push__ip" },
-                "出口 IP ", h("b", null, failure.ip),
-                h(Btn, { small: true, on: () => copy(failure.ip, "ip") }, copied === "ip" ? "已复制" : "复制 IP"))
-              : null)
-          : null,
-        result
-          ? h("div", { className: "gzs-push__ok" },
-            h("div", null, "已进草稿箱：", h("code", null, result.mediaId ?? "")),
-            h("div", { className: "gzs-hint" }, "去公众号后台「内容管理 → 草稿箱」看；发布还是人工点。"),
-            h("div", { style: { marginTop: "6px" } },
-              h(Btn, { small: true, on: () => copy(result.mediaId, "media") }, copied === "media" ? "已复制" : "复制 media_id"),
-              h("a", {
-                href: "https://mp.weixin.qq.com/", target: "_blank", rel: "noreferrer",
-                className: "gzs-hint", style: { marginLeft: "10px" },
-              }, "打开公众号后台 ↗")))
-          : h("div", { className: "gzs-hint" }, "推的是「草稿」不是「发布」：群发 / 发表仍然要人工在后台点。"));
-
-      return h("div", {
-        className: "gzs-modal",
-        onClick: (event) => { if (event.target === event.currentTarget && !busy) onClose?.(); },
-      },
-        h("div", { className: "gzs-modal__card", role: "dialog", "aria-label": "推草稿" },
-          h("div", { className: "gzs-modal__bar" },
-            h("span", { className: "gzs-modal__t" }, "推草稿"),
-            h("span", { className: "gzs-hint" }, configured ? "推到公众号草稿箱" : "先配一下公众号"),
-            h("div", { className: "gzs-spacer" }),
-            h("button", { className: "gzs-chatcol__x", onClick: () => { if (!busy) onClose?.(); }, title: "关闭" }, "×")),
-          h("div", { className: "gzs-modal__body" },
-            status === null && !statusError ? h("div", { className: "gzs-hint" }, "读公众号配置…") : null,
-            configured ? configuredBody : configBody),
-          h("div", { className: "gzs-modal__foot" },
-            configured
-              ? h(Btn, { small: true, kind: "ghost", on: runCheck, disabled: busy }, "重新自查")
-              : null,
-            configured
-              ? h(Btn, {
-                kind: "primary",
-                on: doPush,
-                disabled: busy || problems.length > 0 || Boolean(result) || !id,
-                title: id ? "" : "先去新建 / 打开一篇，再推",
-              }, busy ? "推送中…" : result ? "已推送" : id ? "推草稿" : "先去写一篇")
-              : h(Btn, {
-                kind: "primary",
-                on: saveConfig,
-                // 已经配过的账号允许「只改作者 / 模式」：AppID 留空不算错。
-                disabled: busy || (!form.appId.trim() && !status?.hasSecret && !status?.usable),
-              }, busy ? "保存中…" : "保存并自查"))));
-    }
 
     /**
      * 中栏：标题 + 一行元信息 + 视图切换（成稿 / 手机预览）。
@@ -2905,6 +2704,15 @@ window.__ModuleLoader__.load({
      * 只是外面套一个 390px 的深色壳，让它看起来像一台手机而不是一张白纸。
      */
     function Stage({ article, templates, selected, onSelect, onExport, onRegenerate, onPickVersion, busy }) {
+      /**
+       * 两个视图，**一次只看一个**：成稿（读） / 手机预览（真机宽度）。
+       *
+       * 0.3.x 曾在中栏够宽时自动切成「并排」——左边成稿、右边手机。实测下来是错的：
+       * 两栏渲染的是**同一篇文章的同一段字**，并排只是把同一份内容抄了两遍，
+       * 读起来累，也没多给任何信息（用户原话：「两处显示正文，保留一个就可以了」）。
+       * 排版要看手机上什么样，切成「手机预览」就够了，宽度换来的应该是**留白**，
+       * 不是第二份正文。所以这里只留切换，正文只渲染一处，且整列居中限宽。
+       */
       const [mode, setMode] = React.useState("doc");
       if (!article) {
         return h("div", { className: "gzs-empty" }, h("div", null, "还没有选中文章"), h("div", { className: "gzs-hint" }, "回全部文章挑一篇"));
@@ -2916,27 +2724,32 @@ window.__ModuleLoader__.load({
       const audience = String(article.audience ?? "").trim();
 
       return h("div", { className: "gzs-stage" },
-        h("div", { className: "gzs-stagehead" },
-          h("h1", { className: "gzs-stagetitle" }, article.title || "（还没有标题）"),
-          article.subtitle ? h("p", { className: "gzs-stage-sub" }, article.subtitle) : null),
-        h("div", { className: "gzs-meta" },
-          h("span", null, h("b", null, `${words} 字`), ` · ${sections.length} 节 · ${images} 图`),
-          h("span", { className: "gzs-meta__tpl" }, "模板 ", h("b", null, template.name ?? template.id ?? "—")),
-          // 受众经常是整句（"正在做数字化的药企 IT 负责人"），平铺会把整行撑开、把视图切换挤到折行。
-          // 截到 22ch + title 放全文：前面的字够认，要看全就 hover。
-          h("span", { className: "gzs-meta__aud", title: `受众：${audience || "未填"}` }, "受众 ", h("b", null, audience || "未填")),
-          h("span", null, "更新 ", h("b", null, timeText(article.updatedAt) || "—")),
-          h("div", { className: "gzs-seg gzs-seg--view" },
-            STAGE_MODES.map(([key, label]) => h("button", {
-              key,
-              className: `gzs-btn gzs-btn--sm ${mode === key ? "gzs-btn--on" : ""}`,
-              onClick: () => setMode(key),
-            }, label)))),
-        mode === "phone"
-          ? h("div", { className: "gzs-phonewrap" },
-              h(ExportBar, { article, onExport }),
-              h(PhonePreview, { article, templates, selected, onSelect, busy, onRegenerate, onPickVersion }))
-          : h(Manuscript, { article, selected, onSelect }));
+        h("div", { className: "gzs-stagelay" },
+          h("div", { className: "gzs-stagehead" },
+            h("h1", { className: "gzs-stagetitle" }, article.title || "（还没有标题）"),
+            article.subtitle ? h("p", { className: "gzs-stage-sub" }, article.subtitle) : null),
+          h("div", { className: "gzs-meta" },
+            h("span", null, h("b", null, `${words} 字`), ` · ${sections.length} 节 · ${images} 图`),
+            h("span", { className: "gzs-meta__tpl" }, "模板 ", h("b", null, template.name ?? template.id ?? "—")),
+            // 受众经常是整句（"正在做数字化的药企 IT 负责人"），平铺会把整行撑开、把视图切换挤到折行。
+            // 截到 22ch + title 放全文：前面的字够认，要看全就 hover。
+            h("span", { className: "gzs-meta__aud", title: `受众：${audience || "未填"}` }, "受众 ", h("b", null, audience || "未填")),
+            h("span", null, "更新 ", h("b", null, timeText(article.updatedAt) || "—")),
+            // 导出是文章级动作，放 meta 行；不放预览头顶
+            h(ExportMenu, { article, onExport }),
+            h("div", { className: "gzs-seg gzs-seg--view" },
+              STAGE_MODES.map(([key, label]) => h("button", {
+                key,
+                className: `gzs-btn gzs-btn--sm ${mode === key ? "gzs-btn--on" : ""}`,
+                "aria-pressed": mode === key ? "true" : "false",
+                onClick: () => setMode(key),
+              }, label)))),
+          // 正文和标题必须在**同一个居中列**里：分成两个容器时，标题居中了、正文贴着左墙，
+          // 右边空出一大片——用户截图里那一条就是这么来的。
+          mode === "phone"
+            ? h("div", { className: "gzs-phoneview" },
+                h(PhonePane, { article, templates, selected, onSelect, onRegenerate, onPickVersion, busy }))
+            : h(Manuscript, { article, selected, onSelect })));
     }
 
     // ── 右栏：检查器 ──────────────────────────────────────────────────────────
@@ -3106,13 +2919,218 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 检查器的四个 tab：意见 / 证据 / 图 / 元信息。
+     * 检查器的三个页签（2026-11-09 用户定稿）：
      *
-     * 原来是一整列长滚动（待确认 / 流水线 / 封面 / 图 / 版本 / 反馈 / 账本全在一条线上），
-     * 段落一多就得来回滚。分成四个 tab 之后，**内容一块没少**，只是不再互相挤。
-     * 默认「证据」——人打开一篇稿子，先要知道「还欠什么」。
+     *   第 N 段（整篇 / 封面）   这段的字长什么样
+     *   图 N                    现在有哪些图、多大、什么规格
+     *   版式                     排版按哪套模板、字号行高多少、导出过没有
+     *
+     * **「证据」和「事件」两页已按用户要求删掉。** 它们的内容没丢：
+     * 质量检查、十道门、账本都还在「检查」（治理）抽屉里——那里本来就是
+     * 「这一篇有什么问题、刚才动过什么」的完整视图，右栏再放一份只是重复。
+     * 右栏从此只回答「眼前这一段和它的图长什么样」。
      */
-    const INSP_TABS = [["evidence", "证据"], ["images", "图"], ["meta", "元信息"]];
+    const INSP_TABS = [
+      ["section", "本段"],
+      ["images", "图"],
+      ["layout", "版式"],
+    ];
+
+    /**
+     * 「当前工作上下文」卡：右栏顶上那块。
+     *
+     * 历史工作台右栏有这块（产线 / 期号 / 人物 / 当前节点 + 一句「现在等你做什么」），
+     * 新媒体工作台原来没有——要判断「我在改哪一篇、卡在哪一步」得自己去别的页签里翻。
+     * 这里补上等价物：赛道 / 期号 / 当前定位 / 当前卡点。
+     *
+     * `pending` 决定胶囊颜色与提示语：有必改项时不写「已完成」，
+     * 那是历史工作台已经踩过的坑（红色风险配一个绿色「已完成」）。
+     */
+    function ContextCard(props) {
+      const { article, track, selected, scopeLabel, slotLabel, qa, pipeline, waiting, proposed } = props;
+      const errCount = qa?.counts?.error ?? 0;
+      const warnCount = (qa?.counts?.warn ?? 0);
+      const gateFail = (pipeline?.gates ?? []).filter((g) => g.state === "fail" || g.state === "blocked").length;
+      const pendingList = waiting ?? [];
+      const pending = errCount > 0 || gateFail > 0 || pendingList.length > 0;
+      // 「当前卡点」：只说真正拦人的那一件，不把 warn 也算成卡点（warn 只提醒）
+      const stuck = errCount > 0
+        ? `${errCount} 个必改项`
+        : gateFail > 0
+          ? `${gateFail} 道门未过`
+          : pendingList.length > 0
+            ? `${pendingList.length} 份提案等你确认`
+            : "";
+      // 提示语按「卡点 → 提案 → 提醒 → 无事」排：先说拦人的，再说可选的。
+      const bits = [];
+      if (stuck) bits.push(`现在等你处理：${stuck}。`);
+      if (pendingList.length && !stuck.includes("提案")) bits.push(`${pendingList.length} 份提案可看对照。`);
+      if (warnCount) bits.push(`另有 ${warnCount} 条提醒。`);
+      const episodeNo = pipeline?.episodeNo;
+      return h("div", { className: "gzs-ctx" },
+        h("div", { className: "gzs-ctx__hd" },
+          "当前工作上下文",
+          h(Badge, { level: pending ? "warn" : "ok" }, pending ? "需要关注" : "暂无必改")),
+        h("div", { className: "gzs-ctx__grid" },
+          h("span", null, "内容类型：", h("b", null, track?.name ?? "通用模式")),
+          h("span", null, "期号：", h("b", null,
+            episodeNo ? `第 ${String(episodeNo).padStart(3, "0")} 期` : "未绑期号")),
+          h("span", null, "当前定位：", h("b", null,
+            slotLabel ?? scopeLabel ?? (selected === "article" ? "整篇" : "—"))),
+          h("span", null, "当前卡点：", h("b", null, stuck || "没有")),
+        ),
+        h("div", { className: "gzs-ctx__note" },
+          bits.length ? bits.join("") : "当前没有拦人的问题，改字请走左侧对话。"),
+      );
+    }
+
+    /**
+     * 「本段」页：小标题 + 字数/段数/锚点 + 本段原文。
+     *
+     * 完全照历史工作台的 `WechatSectionPane` 的结构来：先一行「第 N 段」，
+     * 再标题，再三行规格，最后一块引文。区别只有一个：新媒体工作台的一段是
+     * 一个 JSON 段落（没有 md 行号），所以那一行换成「段内段落数」而不是行号——
+     * 给一个假的「第 N 行」比不给更糟。
+     */
+    function SectionPane(props) {
+      const { article, selected, onAsk, artLabel, track, templates, onGovernance } = props;
+      if (selected === "cover") {
+        return h("div", { className: "gzs-inspnote" },
+          "封面在「图」页看（大图与版本），出图控件也在那一页的「出图」折叠区。这一页只给整篇与每一段的原文。");
+      }
+      const sections = article?.sections ?? [];
+      const idx = selected === "article"
+        ? -1
+        : sections.findIndex((s) => `sec-${s.id}` === selected);
+      if (idx < 0) {
+        // 整篇：这一段原来叫「元信息」，历史工作台没有那一页——
+        // 它本来就属于「这一篇是什么」，和「第 N 段」是同一个问题的两个粒度，所以并进来。
+        const totalHan = sections.reduce((sum, s) => sum + countWords(s.body), 0);
+        const life = String(article?.lifecycle || "") || "draft";
+        return h(React.Fragment, null,
+          h("div", { className: "gzs-label" }, "整篇"),
+          h("div", { className: "gzs-sech" }, article?.title || "（还没有标题）"),
+          h("dl", { className: "gzs-kv" },
+            h("dt", null, "字数"), h("dd", null, `${totalHan} 字 / ${sections.length} 段`),
+            h("dt", null, "副标题"), h("dd", null, article?.subtitle || "未填"),
+            h("dt", null, "摘要"), h("dd", null, article?.summary || "还没有摘要"),
+            h("dt", null, "讲给谁"), h("dd", null, article?.audience || "未填"),
+            h("dt", null, "带走什么"), h("dd", null, article?.takeaway || "未填"),
+            h("dt", null, "标签"), h("dd", null, (article?.tags ?? []).join("，") || "未填"),
+            h("dt", null, "内容类型"), h("dd", null, track?.name ?? "通用模式"),
+            h("dt", null, "排版模板"), h("dd", null, templateName(templates, article?.template)),
+            h("dt", null, "到哪了"), h("dd", null,
+              `${life === "published" ? "已发布" : "草稿"}${article?.lifecycleAt
+                ? ` · 你标的 ${timeText(article.lifecycleAt)}`
+                : " · 没标过，默认算草稿"}`),
+          ),
+          h("div", { className: "gzs-row", style: { margin: "8px 0 4px", gap: 6, flexWrap: "wrap" } },
+            h(Btn, { small: true, kind: "ghost", on: () => onGovernance?.() }, "打开「检查」标状态"),
+            h(Btn, {
+              small: true, kind: "ghost",
+              title: "把一句话填进左栏对话（只填不发）",
+              on: () => onAsk?.(`【新媒体工作台】${artLabel} · 改标题/摘要等元信息：现在标题是「${article?.title || "（空）"}」，我想改成 `),
+            }, "让 Agent 改元信息")),
+          h("div", { className: "gzs-label", style: { marginTop: 12 } }, "各段小标题"),
+          h("ol", { className: "gzs-outline" },
+            sections.map((s) => h("li", { key: s.id }, s.heading || "（无小标题）"))),
+        );
+      }
+      const section = sections[idx];
+      const paras = paragraphsOf(section.body);
+      return h(React.Fragment, null,
+        h("div", { className: "gzs-label" }, `第 ${idx + 1} 段`),
+        h("div", { className: "gzs-sech" }, section.heading || "（无小标题）"),
+        h("dl", { className: "gzs-kv" },
+          h("dt", null, "字数"), h("dd", null, `${countWords(section.body)} 字 / ${paras.length} 段`),
+          h("dt", null, "配图"), h("dd", null, section.image?.versions?.length
+            ? `${section.image.versions.length} 个版本`
+            : "还没有图"),
+          h("dt", null, "意见锚点"), h("dd", null, "段号 + 小标题（任一变了，旧提案就过期）"),
+        ),
+        h("div", { className: "gzs-label", style: { marginTop: 12 } }, "本节原文"),
+        paras.length
+          ? h("div", { className: "gzs-quote" }, paras.join("\n\n"))
+          : h("div", { className: "gzs-quote gzs-quote--empty" }, "（这一段还没有正文）"),
+        // 改稿入口留在下面：口径仍然是「右栏不出输入框」，只把话递到左栏
+        h("div", { className: "gzs-row", style: { marginTop: 10 } },
+          h(Btn, {
+            small: true, kind: "ghost",
+            title: "把一句话填进左栏对话（只填不发）",
+            on: () => onAsk?.(`【新媒体工作台】${artLabel} · 第 ${idx + 1} 段（${section.heading || "无小标题"}）改正文：现在写的是「${String(section.body || "").slice(0, 60)}…」，改成 `),
+          }, "让 Agent 改这一段")),
+      );
+    }
+
+    /**
+     * 折叠区：默认收起，点标题展开。
+     *
+     * 为什么要有：右栏的口径是「看板」——打开一个页签先看到的是**东西本身**（图、原文、证据），
+     * 而不是一排操作按钮。出图这类会花额度的动作收在折叠区里：要看才展开，不会误点。
+     */
+    function Collapse({ label, children, defaultOpen = false }) {
+      const [open, setOpen] = React.useState(defaultOpen);
+      return h("div", { className: "gzs-collapse" },
+        h("button", {
+          type: "button",
+          className: `gzs-collapse__hd ${open ? "gzs-collapse__hd--on" : ""}`,
+          "aria-expanded": open ? "true" : "false",
+          onClick: () => setOpen((value) => !value),
+        },
+          h("span", { className: "gzs-collapse__mark" }, open ? "▾" : "▸"),
+          h("span", null, label)),
+        open ? h("div", { className: "gzs-collapse__body" }, children) : null);
+    }
+
+    /**
+     * 「版式」页：排版按哪套模板、正文规格是多少、导出过没有。
+     *
+     * 历史工作台的「版式」给的是排版校验收据（门禁 / 逐字相等 / 排版件 / 正文规格 /
+     * 长图 / 排版哈希 / 核验时间）。新媒体工作台没有那套外部门禁，等价物就是
+     * **模板 tokens + 手机预览宽度 + 账本里的导出记录**——都是「读者最终看到什么」的证据。
+     */
+    function LayoutPane(props) {
+      const { article, templates, ledger, exported } = props;
+      const tokens = templateOf(templates, article?.template).tokens ?? {};
+      const tpl = templateOf(templates, article?.template);
+      const lastExport = (Array.isArray(ledger) ? ledger : [])
+        .filter((row) => row?.type === "export")
+        .pop() ?? null;
+      const fmt = (value, unit = "") => (value === undefined || value === null || value === ""
+        ? "—"
+        : `${value}${unit}`);
+      return h(React.Fragment, null,
+        h("div", { className: "gzs-label" }, "排版体检"),
+        h("dl", { className: "gzs-lines2" },
+          h("span", null, "模板"), h("span", null, `${tpl.name || tpl.id || "—"}${tpl.id && tpl.name ? `（${tpl.id}）` : ""}`),
+          h("span", null, "正文字号"), h("span", null, fmt(tokens.bodySize, "px")),
+          h("span", null, "行高"), h("span", null, fmt(tokens.bodyLine)),
+          h("span", null, "段间距"), h("span", null, fmt(tokens.paraGap, "px")),
+          h("span", null, "标题字号"), h("span", null, fmt(tokens.h2Size, "px")),
+          h("span", null, "左右内边距"), h("span", null, fmt(tokens.padSide, "px")),
+          h("span", null, "强调色"), h("span", null, tokens.accent || "—"),
+        ),
+        tpl.desc
+          ? h(React.Fragment, null,
+            h("div", { className: "gzs-label", style: { marginTop: 12 } }, "这套模板的样子"),
+            h("div", { className: "gzs-quote", style: { fontSize: 11.5, lineHeight: 1.75 } }, tpl.desc))
+          : null,
+        h("div", { className: "gzs-label", style: { marginTop: 12 } }, "手机预览"),
+        h("dl", { className: "gzs-lines2" },
+          h("span", null, "宽度"), h("span", null, `${PHONE_WIDTH}px（真机宽度，不压窄）`),
+          h("span", null, "说明"), h("span", null, "中栏「手机预览」就是按这个宽度排的；导出 HTML 也是同一套 tokens。"),
+        ),
+        h("div", { className: "gzs-label", style: { marginTop: 12 } }, "导出"),
+        h("dl", { className: "gzs-lines2" },
+          h("span", null, "导出过"), h("span", null, lastExport ? `是 · ${String(lastExport.format || "html")}` : "还没有"),
+          h("span", null, "最近一次"), h("span", null, lastExport ? ago(lastExport.ts) : "—"),
+        ),
+        h("div", { className: "gzs-hint", style: { marginTop: 8 } },
+          "导出的 HTML 里正文图是 __IMG_01__ 这类占位符：粘到公众号后台后要按清单替换（这一步插件替不了）。"),
+      );
+    }
+
+
 
     /**
      * 右栏意见区只做两件事：标出当前上下文，或把这个上下文引用到左栏。
@@ -3180,7 +3198,38 @@ window.__ModuleLoader__.load({
         pipeline, pipeBlock, tab: tabProp, onTab, onGovernance,
         // 赛道包（宿主下发）：元信息里显示「按哪套口径写」，规则结果在「证据」的质量检查里
         track,
+        // 「让 Agent 改」的去处：把一句带定位的话填进左栏对话（只填不发，由 Workspace 提供）
+        onAsk,
+        // 一键出齐缺图（串行、可中断、不覆盖旧版）
+        onBatch,
+        // 删整篇（移到回收站）
+        onRemove,
       } = props;
+
+      /**
+       * 右栏是**看板**：只显示"现在是什么"，不给任何能打字的框。
+       *
+       * 这是用户 2026-11-07 明确的口径——"要对话该文案都在左侧的聊天框"。
+       * 之前这里是一整排输入框（标题/摘要/正文/prompt），等于把编辑器搬到看板上，
+       * 和「对话是唯一输入口」自相矛盾。现在每一行都配一颗「让 Agent 改」：
+       * 点了就把带定位的一句话填进左栏对话，人补完按回车。
+       */
+      const ask = (text) => {
+        if (typeof onAsk === "function") onAsk(text);
+      };
+      /** 只读一行：`label` 上方小字，下面就是值（空值说"未填"而不是空白）。 */
+      const ro = (label, value, options = {}) => {
+        const text = String(value ?? "").trim();
+        const { ask: askText, box, empty = "未填", askLabel = "让 Agent 改" } = options;
+        return h("div", { className: "gzs-ro" },
+          h("div", { className: "gzs-ro__k" }, label,
+            askText ? h(Btn, {
+              small: true, kind: "ghost",
+              title: "把一句话填进左栏对话（只填不发），你补完按回车",
+              on: () => ask(askText),
+            }, askLabel) : null),
+          h("div", { className: `gzs-ro__v${text ? "" : " gzs-ro__v--empty"}${box ? " gzs-ro__v--box" : ""}` }, text || empty));
+      };
 
       // hooks 必须无条件执行：article 从 null 变成对象时，早退之后再调 useState 会让 React 报
       // 「Rendered more hooks than during the previous render」，整块面板炸掉。
@@ -3191,8 +3240,11 @@ window.__ModuleLoader__.load({
        *
        * 外层（Workspace）要能在跳转时把 tab 切到对应面板，所以它传 `tab` + `onTab`；
        * 单测/直接调用时没人管它，就退回自己的 state。两种都得能跑，且 hook 顺序不变。
+       *
+       * 默认停在「本段」（2026-11-09 对齐历史工作台）：打开一篇稿子先看眼前这段的字，
+       * 而不是先读一屏机器结论。要看「还欠什么」就点「证据」，那个页签带条数。
        */
-      const [localTab, setLocalTab] = React.useState("evidence");
+      const [localTab, setLocalTab] = React.useState("section");
       const tab = tabProp ?? localTab;
       const setTab = onTab ?? setLocalTab;
 
@@ -3235,6 +3287,31 @@ window.__ModuleLoader__.load({
         return () => cancelAnimationFrame(raf);
       }, [confirm]);
 
+      /**
+       * 「删掉这一段」的二次确认：点一次变成「真的删？」，3 秒内再点才真删。
+       *
+       * 删段落的是一次 POST `/save`，写下去就没了（没有撤销）。误点一下得回去翻版本、
+       * 手工补回来，所以复用文件里已有的手势（提案卡的「确认写入？」），不另造弹窗。
+       * 3 秒是「够看清、又不至于一直挂着」的折中：超时自己复位，
+       * 免得过一会儿回来随手一点就成确认。
+       */
+      const [armDelete, setArmDelete] = React.useState("");
+      // 删整篇同样要二次确认：一次误点就是几个小时的工作（虽然进的是回收站）
+      const [armRemove, setArmRemove] = React.useState(false);
+      React.useEffect(() => {
+        if (!armRemove) return undefined;
+        const timer = setTimeout(() => setArmRemove(false), 4000);
+        return () => clearTimeout(timer);
+      }, [armRemove]);
+      React.useEffect(() => { setArmRemove(false); }, [article?.id]);
+      React.useEffect(() => {
+        if (!armDelete) return undefined;
+        const timer = setTimeout(() => setArmDelete(""), 3000);
+        return () => clearTimeout(timer);
+      }, [armDelete]);
+      // 换了段（或换了文章）就撤销待确认：否则对着新段的第一下就成了「真的删」
+      React.useEffect(() => { setArmDelete(""); }, [selected, article?.id]);
+
       if (!article) {
         return h("div", { className: "gzs-insp" }, h("div", { className: "gzs-hint" }, "左侧选一段开始。"));
       }
@@ -3246,10 +3323,7 @@ window.__ModuleLoader__.load({
       const versions = Array.isArray(slotData?.versions) ? slotData.versions : [];
       const active = currentVersion(slotData);
       const tokens = templateOf(templates, article.template).tokens;
-      // 推草稿回执 → 草稿箱（自动推断）。按钮的「当前值」也要跟着它走，
-      // 否则刚推完，界面还亮着「草稿」，人以为没推成功。
-      const pushedToDraftBox = (ledger ?? []).some((row) => row?.type === "publish" && row.persisted !== false);
-      const lifeValue = String(article.lifecycle || "") || (pushedToDraftBox ? "draftbox" : "draft");
+      const lifeValue = String(article.lifecycle || "") || "draft";
       // 这个槽位的反馈：待带上 / 已带上。列表里只看本槽位，跨槽位混着看会误导
       //（封面说「字太大」跟第 3 段配图没关系，混进来会让人以为出图真的会带过去）。
       const fb = feedback ?? { bySlot: {} };
@@ -3284,256 +3358,261 @@ window.__ModuleLoader__.load({
         hidden: tab !== key,
       }, children);
 
+      /**
+       * 页签栏：数字取自**当前这一篇的真实计数**，不是写死的文案。
+       *
+       * 「图」给有图的槽位数（封面也算一个），「证据」给质量检查条数。
+       * 0 不显示——历史工作台那边「事件 0」也只是一格噪音。
+       */
+      const imageSlots = [
+        article?.cover ? "cover" : null,
+        ...(article?.sections ?? []).map((s) => `sec-${s.id}`),
+      ].filter(Boolean);
+      const slotsWithImage = imageSlots.filter((slot) => {
+        const data = slot === "cover" ? article?.cover : (article?.sections ?? []).find((s) => `sec-${s.id}` === slot)?.image;
+        return Boolean(currentVersion(data));
+      }).length;
+      const qaCount = (qa?.items ?? []).length;
+      // 页签标签照历史工作台的写法：第一个是**具体定位**（第 1 节 / 全文），不是固定词。
+      // 历史工作台：第 1 节 / 图 5 / 版式 / 证据 12 / 事件 0
+      const sectionTabLabel = selected === "article"
+        ? "整篇"
+        : selected === "cover"
+          ? "封面"
+          : (() => {
+            const i = (article?.sections ?? []).findIndex((s) => `sec-${s.id}` === selected);
+            return i >= 0 ? `第 ${i + 1} 段` : "本段";
+          })();
+      const tabLabel = { section: sectionTabLabel, images: "图", layout: "版式" };
+      const tabCount = {
+        section: null,
+        images: slotsWithImage || null,
+        layout: null,
+      };
+
       const tabBar = h("div", { className: "gzs-itabs" },
-        INSP_TABS.map(([key, text]) => h("button", {
+        INSP_TABS.map(([key]) => h("button", {
           key,
           className: `gzs-itab ${tab === key ? "gzs-itab--on" : ""}`,
           onClick: () => setTab(key),
-        }, text)));
+        }, tabLabel[key], tabCount[key] ? h("span", { className: "gzs-itab__n" }, String(tabCount[key])) : null)));
 
+      // 「让 Agent 改」那句话里要带上这是哪一篇：对话里可能同时在聊别的事。
+      const artLabel = String(article?.title || "这一篇").slice(0, 24);
+
+      // 槽位标签：尺寸跟着「当前版本的真实尺寸」走。原来写死 900×383，可出图接口实际给的是
+      // 1664×704（64 的倍数吸附后的档位），头上一写 900×383 就和下面的版本卡自相矛盾。
+      // 提前到这里算，是因为顶部上下文卡的「当前定位」要用它（否则整篇/封面两处口径不一）。
+      const realSize = active?.width && active?.height ? `${active.width}×${active.height}` : "";
+      const slotLabel = selected === "cover"
+        ? `封面${realSize ? `（${realSize}）` : "（目标 2.35:1）"}`
+        : selected === "article"
+          ? "整篇"
+          : `第 ${sectionIndex(selected)} 段配图${realSize ? `（${realSize}）` : ""}`;
+
+      // 上下文卡：两种选中态都要有，只是「当前定位」不同。
+      const contextCard = h(ContextCard, {
+        article, track, selected, scopeLabel, slotLabel, qa, pipeline, waiting,
+        proposed: (proposals ?? []).length,
+      });
       if (selected === "article") {
-        const items = qa?.items ?? [];
         return h("div", { className: "gzs-insp" },
-          h("div", { className: "gzs-insphead" },
-            h("span", null, "整篇"),
-            h("div", { className: "gzs-spacer" }),
-            waiting.length ? h(Badge, { level: "info" }, `${waiting.length} 份提案`) : null,
-            qa ? h(Badge, { level: qa.ok ? "ok" : "error" }, qa.ok ? "可发布" : `${qa.counts.error} 个必改`) : null),
+          contextCard,
           tabBar,
 
-          // 证据：质量检查 + 流水线 + 十道门 + 动作记录。
-          // 「意见」那一栏已经去掉——讨论与改稿都在左侧 DSH 原生对话里完成，
-          // 右栏只保留「这篇现在什么状态、哪里有问题」这类看板信息。
-          panel("evidence",
-            h("div", { className: "gzs-label" }, "质量检查"),
-            qaItems(items),
-            h("div", { className: "gzs-row", style: { gap: 6, flexWrap: "wrap", margin: "6px 0 2px" } },
-              h("button", { className: "gzs-chip", onClick: () => onGovernance?.() },
-                deai ? `去 AI 味 · ${deai.total ? `${deai.total} 处` : "干净"}` : "去 AI 味 · 未查"),
-              h("button", { className: "gzs-chip", onClick: () => onGovernance?.() },
-                reviews ? `审阅 · ${reviews.done}/${reviews.total}` : "审阅 · 未开始"),
-              h("button", { className: "gzs-chip gzs-chip--on", onClick: () => onGovernance?.() }, "去「检查」→")),
-            h("div", { className: "gzs-sep" }),
-            h(PipeBlock, pipeBlock ?? {}),
-            h("div", { className: "gzs-sep" }),
-            h("div", { className: "gzs-label" }, "十道门"),
-            pipeline?.gates?.length
-              ? h(GateList, { gates: pipeline.gates })
-              : h("div", { className: "gzs-hint" },
-                pipeline?.bound ? "门禁这一轮没返回条目，点「刷新」重查一次。" : "绑上期号之后，这里换成盘上门禁的真结论。"),
-            h("div", { className: "gzs-sep" }),
-            h("div", { className: "gzs-label" }, "动作记录"),
-            ledgerBlock(ledger)),
+          // 本段：整篇时给标题、全篇字数与各段小标题——「这篇讲到哪」的最短答案
+          panel("section", h(SectionPane, { article, selected, onAsk: ask, artLabel, track, templates, onGovernance })),
 
-          // 图：一篇里所有槽位，点一张切到那个槽位
-          panel("images", h(ImageBoard, { article, onSelect })),
+          // 图：一篇里所有槽位，点一张切到那个槽位（看图，不是出图台）
+          panel("images", h(ImageBoard, { article, onSelect, onBatch, busy, onAsk })),
 
-          // 元信息：标题 / 副标题 / 摘要 / 标签 / 生命周期 / 模板
-          panel("meta",
-            h(Field, { label: "标题（≤64 字，建议 ≤30）" },
-              h(TextInput, { value: article.title, placeholder: "谁 + 做了什么 + 结果", onCommit: (v) => onSaveArticle({ title: v }) })),
-            h(Field, { label: "副标题（可空）" },
-              h(TextInput, { value: article.subtitle, onCommit: (v) => onSaveArticle({ subtitle: v }) })),
-            h(Field, { label: "摘要（≤120 字）" },
-              h(TextInput, { value: article.summary, rows: 3, placeholder: "一句话说清给谁、解决什么", onCommit: (v) => onSaveArticle({ summary: v }) })),
-            // 标签：自由填几个词（逗号分隔），用来检索。不填也不影响什么。
-            h(Field, { label: `标签（用来检索，逗号分隔${(article.tags ?? []).length ? ` · ${article.tags.length} 个` : ""}）` },
-              h(TextInput, {
-                value: (article.tags ?? []).join("，"),
-                placeholder: "例：药企，审批流，数字化",
-                onCommit: (v) => onSaveArticle({ tags: String(v ?? "").split(/[,，、\s]+/).map((x) => x.trim()).filter(Boolean) }),
-              })),
-            (article.tags ?? []).length
-              ? h("div", { className: "gzs-row", style: { gap: 4, flexWrap: "wrap", marginBottom: 10 } },
-                (article.tags ?? []).map((tag) => h("span", { key: tag, className: "gzs-chip gzs-chip--on" }, tag)))
-              : null,
-            h(Field, { label: "这篇到哪了" },
-              h("div", { className: "gzs-row", style: { gap: 5, flexWrap: "wrap" } },
-                [["draft", "草稿"], ["draftbox", "草稿箱"], ["published", "已发布"]].map(([key, text]) =>
-                  h(Btn, {
-                    key, small: true, kind: lifeValue === key ? "primary" : "ghost",
-                    on: () => onSaveArticle({ lifecycle: key }),
-                  }, text)),
-                article.lifecycleAt
-                  ? h("span", { className: "gzs-hint", style: { alignSelf: "center" } }, `你标的 · ${timeText(article.lifecycleAt)}`)
-                  : pushedToDraftBox
-                    ? h("span", { className: "gzs-hint", style: { alignSelf: "center" } }, "按账本：已进草稿箱（自动推断）")
-                    : null)),
-            h(Field, { label: "内容类型口径" },
-              track
-                ? h("div", { className: "gzs-trackinfo" },
-                  h("div", { className: "gzs-trackinfo__h" }, `${track.name} · ${track.tierLabel || ""}`.trim()),
-                  track.tone ? h("div", { className: "gzs-trackinfo__d" }, track.tone) : null,
-                  (track.structure ?? []).length
-                    ? h("div", { className: "gzs-trackinfo__s" }, (track.structure ?? []).join(" → "))
-                    : null,
-                  h("div", { className: "gzs-hint" },
-                    `规则：禁用词 ${track.rules?.forbidden ?? 0} 条 · 必须声明 ${track.rules?.required ?? 0} 条；命中结果在「证据」里。`))
-                : h("div", { className: "gzs-hint" }, "通用模式：不套内容类型也能写、能出图、能推；选了才多一套禁用词与必须声明。")),
-            h(Field, { label: "排版模板" },
-              h("select", {
-                className: "gzs-select", style: { width: "100%" }, value: article.template,
-                onChange: (e) => onTemplate(e.target.value),
-              }, (templates ?? []).map((t) => h("option", { key: t.id, value: t.id }, t.name)))),
-            h("div", { className: "gzs-hint" },
-              "改稿走 Agent 的 /propose：先在「检查」里看对照，确认后才写正文。")));
+          // 版式：模板 tokens + 手机预览宽度 + 导出记录（对齐历史工作台的「版式」）
+          panel("layout", h(LayoutPane, { article, templates, ledger })),
+
+          // 「证据」「事件」两页已按用户要求删掉：质量检查 / 十道门 / 账本都在「检查」抽屉里。
+
+          // 删整篇：只有这里是「再也看不见」的动作，放在第一页（整篇）的最下面，
+          // 且要再点一次——它不属于任何一个「看」的页签。
+          h("div", { className: "gzs-inspfoot" },
+            h(Btn, {
+              small: true,
+              kind: armRemove ? "primary" : "ghost",
+              disabled: Boolean(busy),
+              title: armRemove ? "4 秒内再点一次才真的删" : "删之前要再点一次确认",
+              on: () => {
+                if (!armRemove) { setArmRemove(true); return; }
+                setArmRemove(false);
+                onRemove?.(article.id);
+              },
+            }, armRemove ? "真的删？" : "删掉这一篇")));
       }
 
       // ── 槽位级 ──
-      // 尺寸标签跟着「当前版本的真实尺寸」走。原来写死 900×383，可出图接口实际给的是
-      // 1664×704（64 的倍数吸附后的档位），头上一写 900×383 就和下面的版本卡自相矛盾。
-      const realSize = active?.width && active?.height ? `${active.width}×${active.height}` : "";
-      const label = selected === "cover"
-        ? `封面${realSize ? `（${realSize}）` : "（目标 2.35:1）"}`
-        : `第 ${sectionIndex(selected)} 段配图${realSize ? `（${realSize}）` : ""}`;
       const preset = selected === "cover" ? "900x383" : "1024x576";
-      const scopeQa = (qa?.items ?? []).filter((item) => item.scope === selected);
 
       return h("div", { className: "gzs-insp" },
-        h("div", { className: "gzs-insphead" },
-          h("span", null, label),
-          h("div", { className: "gzs-spacer" }),
-          active ? h(Badge, { level: "ok" }, active.vid) : h(Badge, { level: "warn" }, "未出图")),
+        contextCard,
         tabBar,
 
-        // 意见：这个槽位的检查项 + 反馈（反馈不改图，下一版出图自动带上）
-        // 证据：流水线 + 十道门 + 本槽位的动作记录（跨槽位混着看会误导）
-        panel("evidence",
-          h("div", { className: "gzs-label" }, "质量检查"),
-          qaItems(scopeQa),
-          h("div", { className: "gzs-sep" }),
-          h(PipeBlock, pipeBlock ?? {}),
-          h("div", { className: "gzs-sep" }),
-          h("div", { className: "gzs-label" }, "十道门"),
-          pipeline?.gates?.length
-            ? h(GateList, { gates: pipeline.gates })
-            : h("div", { className: "gzs-hint" },
-              pipeline?.bound ? "门禁这一轮没返回条目，点「刷新」重查一次。" : "绑上期号之后，这里换成盘上门禁的真结论。"),
-          h("div", { className: "gzs-sep" }),
-          h("div", { className: "gzs-label" }, "本槽位的动作"),
-          ledgerBlock(ledger, selected)),
+        // 本段：这一段的小标题 / 字数 / 锚点 / 原文（对齐历史工作台的同一个页签）
+        panel("section", h(SectionPane, { article, selected, onAsk: ask, artLabel, track, templates, onGovernance })),
 
-        // 元信息：段落正文在这里改（选中段时一并可改，省得来回切）
-        panel("meta",
-          currentSection
-            ? h(React.Fragment, null,
-              h(Field, { label: "小标题" },
-                h(TextInput, { value: currentSection.heading, placeholder: "这一段讲什么", onCommit: (v) => onSaveSection(currentSection.id, { heading: v }) })),
-              h(Field, { label: `正文（${countWords(currentSection.body)} 字）` },
-                h(TextInput, {
-                  value: currentSection.body, rows: 7, placeholder: "一个段落一个意思；空行分段",
-                  onCommit: (v) => onSaveSection(currentSection.id, { body: v }),
-                })),
-              h("div", { className: "gzs-row", style: { margin: "0 0 10px" } },
-                h(Btn, { small: true, kind: "ghost", on: () => onDeleteSection(currentSection.id) }, "删掉这一段")))
-            : h("dl", { className: "gzs-kv" },
-              h("dt", null, "稿件 ID"), h("dd", null, article.id),
-              h("dt", null, "槽位"), h("dd", null, selected),
-              h("dt", null, "目标尺寸"), h("dd", null, selected === "cover" ? "900×383（2.35:1）" : "1024×576（16:9）"),
-              h("dt", null, "当前版本"), h("dd", null, active ? `${active.vid} · ${realSize}` : "还没有图"),
-              h("dt", null, "版本数"), h("dd", null, String(versions.length)),
-              h("dt", null, "图注"), h("dd", null, slotData?.caption || "未填"))),
-
-        // 图：prompt / 反向词 / 节点 / 出图 / 大图 / 版本条
+        // 图：**看图**。缩略图 → 大图 → 规格行 → 版本条；
+        // 出图控件收进最下面的折叠区（默认收起），所以这一页打开来只有图。
         panel("images",
-          h(Field, { label: "出图 prompt（会存档，下次微调直接用）" },
-            h(TextInput, {
-              value: slotData?.prompt ?? "", rows: 4, mark: "prompt",
-              placeholder: "主体 + 场景 + 光线 + 色调；不要写「高级感」这类形容词",
-              onCommit: (v) => onSaveSlot(selected, { prompt: v }),
-            })),
-          h(Field, { label: "不要出现（反向）" },
-            h(TextInput, {
-              value: slotData?.negative ?? "", rows: 2, placeholder: "文字、水印、人脸…",
-              onCommit: (v) => onSaveSlot(selected, { negative: v }),
-            })),
-          h(Field, { label: "图注（可空，显示在图下方）" },
-            h(TextInput, { value: slotData?.caption ?? "", onCommit: (v) => onSaveSlot(selected, { caption: v }) })),
-          h("div", { className: "gzs-row", style: { gap: 8, marginBottom: 12 } },
-            h("div", { className: "gzs-grow" },
-              h("label", { className: "gzs-label" }, "出图节点"),
-              h("select", {
-                className: "gzs-select", style: { width: "100%" }, value: nodeId || "",
-                onChange: (e) => setNodeId(e.target.value),
-              },
-                h("option", { value: "" }, "（用默认）"),
-                (nodes ?? []).map((n) => h("option", { key: n.id, value: n.id, disabled: !n.usable },
-                  `${n.name}${n.usable ? "" : `（${n.reason}）`}`)))),
-            h("div", { style: { paddingTop: 17 } },
-              h(Btn, {
-                kind: "primary",
-                title: active ? "会生成一个新版本，旧版不覆盖" : "按上面的 prompt 出图",
-                disabled: Boolean(busy),
-                // 第一次出图前确认一次（决策：A）。理由有两条，用户都需要知道：
-                // ① 这一步**会花额度**，点下去就没了；② 会**自动带上待用的反馈**，
-                // 带上之后那些反馈就从「待带上」变「已带上」，下一版不再重复带。
-                // 同一篇确认过一次就不再问——一篇文章十几张图，每次都弹会烦到关掉它。
-                on: () => {
-                  if (confirmedGen.current) {
-                    onGenerate({ slot: selected, node: nodeId || undefined, size: slotData?.size || preset, prompt: promptOnScreen(slotData?.prompt), negative: slotData?.negative });
-                    return;
-                  }
-                  const openCount = myFeedback.open.length;
-                  setConfirm({
-                    slot: selected,
-                    count: openCount,
-                    isCover: selected === "cover",
-                    hd: String(promptOnScreen(slotData?.prompt) || "").slice(0, 60),
-                  });
-                },
-              }, busy ? "出图中…" : "出图"))),
-
-          confirm
-            ? h("div", { className: "gzs-confirm", ref: confirmRef },
-              h("div", { className: "gzs-confirm__t" },
-                `要出${confirm.isCover ? "封面" : `第 ${sectionIndex(confirm.slot)} 段配图`}了`),
-              h("div", { className: "gzs-confirm__b" },
-                h("div", null, "这一步会消耗出图额度，一次一张。"),
-                confirm.hd ? h("div", { className: "gzs-confirm__hd" }, `这次用：${confirm.hd}…`) : null,
-                h("div", null,
-                  confirm.count
-                    ? `会带上 ${confirm.count} 条你之前提的反馈——带上之后它们就标「已带上」，下一版不再重复带。`
-                    : "这个槽位没有待用的反馈，这次只按上面的 prompt 出。"),
-                h("div", { className: "gzs-hint", style: { marginTop: 4 } }, "同一篇里确认这一次，后面出图不再问。")),
-              h("div", { className: "gzs-confirm__acts" },
-                h(Btn, {
-                  kind: "primary", small: true,
-                  on: () => {
-                    confirmedGen.current = true;
-                    const target = confirm;
-                    setConfirm(null);
-                    onGenerate({ slot: target.slot, node: nodeId || undefined, size: slotData?.size || preset, prompt: promptOnScreen(slotData?.prompt), negative: slotData?.negative });
-                  },
-                }, "确认，出图"),
-                h(Btn, { small: true, kind: "ghost", on: () => setConfirm(null) }, "先不出")))
-            : null,
-
-          // 大图 / 空态
-          active
-            ? h("div", { style: { margin: "0 0 12px" } },
-              h("img", { className: "gzs-thumb", src: imageUrl(article.id, selected, active.vid), alt: label }),
-              h("div", { className: "gzs-mono", style: { marginTop: 6 } },
-                `${active.width}×${active.height}${active.width && active.height ? ` · ${(active.width / active.height).toFixed(2)}:1` : ""} · ${Math.round((active.bytes ?? 0) / 1024)} KB`),
-              active.note ? h("div", { className: "gzs-hint", style: { marginTop: 4 } }, active.note) : null)
-            : h("div", { className: "gzs-empty", style: { minHeight: 120 } }, "还没有图。写好 prompt 点「出图」。"),
-
-          h("div", { className: "gzs-sep" }),
-
-          // 版本条
-          h("div", { className: "gzs-sect__head", style: { marginBottom: 8 } },
-            h("span", null, `版本（${versions.length}）`),
+          h("div", { className: "gzs-galleryhead" },
+            h("span", null, `配图（${imageSlots.filter((slot) => Boolean(currentVersion(
+              slot === "cover" ? article?.cover : (article?.sections ?? []).find((s) => `sec-${s.id}` === slot)?.image,
+            ))).length}）`),
             h("div", { className: "gzs-spacer" }),
-            h("span", { className: "gzs-hint" }, "旧版不覆盖，点一下切回")),
-          versions.length
-            ? versions.slice().reverse().map((v) => h("div", {
-              key: v.vid,
-              className: `gzs-ver ${v.vid === active?.vid ? "gzs-ver--on" : ""}`,
-              onClick: () => onPick(selected, v.vid),
-            },
-              h("span", { className: "gzs-ver__vid" }, v.vid),
-              h("span", { className: "gzs-ver__meta" }, `${v.width}×${v.height} · ${v.node} · ${ago(v.createdAt)}`),
-              v.vid === active?.vid ? h(Badge, { level: "ok" }, "当前") : null))
-            : h("div", { className: "gzs-hint" }, "还没有版本。")));
+            h("span", { className: "gzs-hint" }, "点缩略图切到那个槽位")),
+          h("div", { className: "gzs-gallery" },
+            imageSlots.map((slot) => {
+              const data = slot === "cover"
+                ? article?.cover
+                : (article?.sections ?? []).find((s) => `sec-${s.id}` === slot)?.image;
+              const version = currentVersion(data);
+              const label = slot === "cover" ? "封面" : `第 ${sectionIndex(slot)} 段`;
+              return h("button", {
+                key: slot, type: "button",
+                className: `gzs-gallery__slot ${slot === selected ? "gzs-gallery__slot--on" : ""}`,
+                title: version ? `${label} · ${version.vid}` : `${label} · 还没有图`,
+                onClick: () => onSelect?.(slot),
+              },
+                version
+                  ? h("img", { src: imageUrl(article.id, slot, version.vid), alt: label, loading: "lazy" })
+                  : h("span", { className: "gzs-gallery__gap" }, "缺图"),
+                h("span", { className: "gzs-gallery__cap" }, label));
+            })),
+          active
+            ? h("div", { className: "gzs-bigpic" },
+              h("img", { src: imageUrl(article.id, selected, active.vid), alt: slotLabel, decoding: "async" }))
+            : h("div", { className: "gzs-empty", style: { minHeight: 110 } }, "这个槽位还没有图。"),
+          active
+            ? h("dl", { className: "gzs-lines2", style: { marginTop: 10 } },
+              h("span", null, "类型"), h("span", null, slotLabel),
+              h("span", null, "版本"), h("span", null, active.vid),
+              h("span", null, "尺寸"), h("span", null,
+                active.width && active.height
+                  ? `${active.width}×${active.height} · ${(active.width / active.height).toFixed(2)}:1`
+                  : "读不到"),
+              h("span", null, "大小"), h("span", null, active.bytes ? `${Math.round(active.bytes / 1024)} KB` : "读不到"),
+              h("span", null, "模型"), h("span", null, active.model || active.node || "—"),
+              h("span", null, "出图时间"), h("span", null, active.createdAt
+                ? String(new Date(active.createdAt).toISOString()).slice(0, 16).replace("T", " ")
+                : "—"),
+              h("span", null, "图注"), h("span", null, slotData?.caption || "未填"),
+              active.note ? h("span", null, "说明") : null,
+              active.note ? h("span", null, active.note) : null)
+            : null,
+          versions.length > 1
+            ? h(React.Fragment, null,
+              h("div", { className: "gzs-sect__head", style: { marginTop: 12, marginBottom: 8 } },
+                h("span", null, `版本（${versions.length}）`),
+                h("div", { className: "gzs-spacer" }),
+                h("span", { className: "gzs-hint" }, "旧版不覆盖，点一下切回")),
+              versions.slice().reverse().map((v) => h("div", {
+                key: v.vid,
+                className: `gzs-ver ${v.vid === active?.vid ? "gzs-ver--on" : ""}`,
+                onClick: () => onPick(selected, v.vid),
+              },
+                h("span", { className: "gzs-ver__vid" }, v.vid),
+                h("span", { className: "gzs-ver__meta" },
+                  `${v.width}×${v.height} · ${v.node} · ${ago(v.createdAt)}`),
+                v.vid === active?.vid ? h(Badge, { level: "ok" }, "当前") : null)))
+            : null,
+          // 出图：默认收起。看图这一页打开就该只有图，要动手才展开。
+          h(Collapse, { label: active ? "换一张（重新出图）" : "出一张" },
+            h("div", { className: "gzs-inspnote" },
+              "prompt 只显示，不在这里改。要改就点「让 Agent 改」；改好回这里点「出图」。"),
+            ro("出图 prompt", slotData?.prompt, {
+              box: true,
+              empty: "还没有 prompt（会让 Agent 先写字）",
+              ask: `【新媒体工作台】${artLabel} · ${selected} 改出图 prompt：现在是「${String(slotData?.prompt || "（空）").slice(0, 60)}…」，改成 `,
+            }),
+            ro("不要出现（反向）", slotData?.negative, {
+              empty: "未填",
+              ask: `【新媒体工作台】${artLabel} · ${selected} 的「不要出现」：现在是「${slotData?.negative || "（空）"}」，加上 `,
+            }),
+            h("div", { className: "gzs-row", style: { gap: 8, marginBottom: 12 } },
+              h("div", { className: "gzs-grow" },
+                h("label", { className: "gzs-label" }, "这次出图用哪个节点"),
+                h("select", {
+                  className: "gzs-select", style: { width: "100%" }, value: nodeId || "",
+                  onChange: (e) => setNodeId(e.target.value),
+                },
+                  h("option", { value: "" }, "（用默认）"),
+                  (nodes ?? []).map((n) => h("option", { key: n.id, value: n.id, disabled: !n.usable },
+                    `${n.name}${n.usable ? "" : `（${n.reason}）`}`)))),
+              h("div", { style: { paddingTop: 17 } },
+                String(slotData?.prompt ?? "").trim()
+                  ? h(Btn, {
+                    kind: "primary",
+                    title: active ? "会生成一个新版本，旧版不覆盖" : "按上面的 prompt 出图",
+                    disabled: Boolean(busy),
+                    on: () => {
+                      if (confirmedGen.current) {
+                        onGenerate({ slot: selected, node: nodeId || undefined, size: slotData?.size || preset, prompt: promptOnScreen(slotData?.prompt), negative: slotData?.negative });
+                        return;
+                      }
+                      const openCount = myFeedback.open.length;
+                      setConfirm({
+                        slot: selected,
+                        count: openCount,
+                        isCover: selected === "cover",
+                        hd: String(promptOnScreen(slotData?.prompt) || "").slice(0, 60),
+                      });
+                    },
+                  }, busy ? "出图中…" : "出图")
+                  : h(Btn, {
+                    kind: "primary", disabled: Boolean(busy),
+                    title: "出图要先有 prompt（AI 写）。点一下把话递进左栏对话",
+                    on: () => ask(`【新媒体工作台】${artLabel} · ${selected} 还没有出图 prompt。请按这一段的小标题与正文写一句出图 prompt（主体 + 场景 + 光线 + 色调，别写「高级感」这类形容词），写完我再出图。`),
+                  }, "让 Agent 写 prompt"))),
+            confirm
+              ? h("div", { className: "gzs-confirm", ref: confirmRef },
+                h("div", { className: "gzs-confirm__t" },
+                  `要出${confirm.isCover ? "封面" : `第 ${sectionIndex(confirm.slot)} 段配图`}了`),
+                h("div", { className: "gzs-confirm__b" },
+                  h("div", null, "这一步会消耗出图额度，一次一张。"),
+                  confirm.hd ? h("div", { className: "gzs-confirm__hd" }, `这次用：${confirm.hd}…`) : null,
+                  h("div", null,
+                    confirm.count
+                      ? `会带上 ${confirm.count} 条你之前提的反馈——带上之后它们就标「已带上」，下一版不再重复带。`
+                      : "这个槽位没有待用的反馈，这次只按上面的 prompt 出。")),
+                h("div", { className: "gzs-confirm__acts" },
+                  h(Btn, {
+                    kind: "primary", small: true,
+                    on: () => {
+                      confirmedGen.current = true;
+                      const target = confirm;
+                      setConfirm(null);
+                      onGenerate({ slot: target.slot, node: nodeId || undefined, size: slotData?.size || preset, prompt: promptOnScreen(slotData?.prompt), negative: slotData?.negative });
+                    },
+                  }, "确认，出图"),
+                  h(Btn, { small: true, kind: "ghost", on: () => setConfirm(null) }, "先不出")))
+              : null)),
+
+        // 版式：这一页对每个槽位都一样（模板是文章级的），但页签要在，口径才一致
+        panel("layout", h(LayoutPane, { article, templates, ledger })),
+
+        // 「证据」「事件」两页已按用户要求删掉（同上）。
+
+        // 段落级动作：删段只在这一段被选中时出现，所以挂在页签下面而不是塞进某一页
+        currentSection
+          ? h("div", { className: "gzs-inspfoot" },
+            h(Btn, {
+              small: true,
+              kind: armDelete === currentSection.id ? "primary" : "ghost",
+              disabled: Boolean(busy),
+              title: armDelete === currentSection.id ? "3 秒内再点一次才真删" : "删之前要再点一次确认",
+              on: () => {
+                if (armDelete !== currentSection.id) { setArmDelete(currentSection.id); return; }
+                setArmDelete("");
+                onDeleteSection(currentSection.id);
+              },
+            }, armDelete === currentSection.id ? "真的删？" : "删掉这一段"))
+          : null);
     }
 
     /** 十道门的证据：编号 / 记号 / 名称 / 结论。一行一道门，说明截两行、title 里给全。 */
@@ -3552,13 +3631,32 @@ window.__ModuleLoader__.load({
           gate.detail ? h("span", { className: "gzs-gate__detail" }, gate.detail) : null)));
     }
 
-    /** 「图」tab：一篇里所有槽位的当前图。点一张切到那个槽位。 */
-    function ImageBoard({ article, onSelect }) {
+    /**
+     * 「图」tab：一篇里所有槽位的当前图。点一张切到那个槽位。
+     *
+     * 缺图多的时候给一颗「一键出齐缺图」：逐格点是 11 步里唯一的体力活。
+     * 只挑**当前没有图**的槽位，已有的版本一张都不动；确认卡先说清要花几张额度。
+     */
+    function ImageBoard({ article, onSelect, onBatch, busy }) {
+      // hooks 写在早退之前：article 从 null 到有值时会换一次走法，顺序不能变
+      const [askBatch, setAskBatch] = React.useState(false);
       if (!article) return null;
       const sections = Array.isArray(article.sections) ? article.sections : [];
       const slots = [{ slot: "cover", label: "封面", image: article.cover }]
         .concat(sections.map((section, index) => ({ slot: `sec-${section.id}`, label: `第 ${index + 1} 段`, image: section.image })));
       const withImage = slots.filter((row) => currentVersion(row.image)).length;
+      /**
+       * 缺图分两档：**有 prompt 的**可以直接出，**没 prompt 的**得先让 AI 写。
+       *
+       * 宿主的 `/generate` 明确要求「先写 prompt 再出图」（空 prompt 直接 400），
+       * 而 prompt 现在是 AI 产出的东西（右栏是看板，不给人敲）。所以一键出齐只能
+       * 先出有 prompt 的那几张，剩下的把话递给左栏——不能拿小标题硬凑一句 prompt
+       * 去糊出图，那出来的图只会更差，还让人觉得"AI 就这水平"。
+       */
+      const missingSlots = slots.filter((row) => !currentVersion(row.image));
+      const ready = missingSlots.filter((row) => String(row.image?.prompt ?? "").trim()).map((row) => row.slot);
+      const needPrompt = missingSlots.length - ready.length;
+      const missing = ready;
       return h("div", null,
         h("div", { className: "gzs-hint", style: { marginBottom: 8 } },
           `${withImage}/${slots.length} 个槽位有图 · 点一张切到那个槽位`),
@@ -3575,31 +3673,40 @@ window.__ModuleLoader__.load({
               h("figcaption", null,
                 h("span", null, row.label),
                 h("span", null, version ? version.vid : "—")));
-          })));
+          })),
+        missingSlots.length
+          ? (missing.length
+            ? (askBatch
+              ? h("div", { className: "gzs-confirm", style: { marginTop: 10 } },
+                h("div", { className: "gzs-confirm__t" }, `要一次出齐 ${missing.length} 张吗`),
+                h("div", { className: "gzs-confirm__b" },
+                  h("div", null, "会消耗出图额度，一次一张串行出：出好一张就刷新一张。"),
+                  needPrompt
+                    ? h("div", null, `另有 ${needPrompt} 张还没有 prompt（要 AI 先写），这次先跳过。`)
+                    : null,
+                  h("div", { className: "gzs-hint", style: { marginTop: 4 } }, "已经有图的槽位一张都不动。中途可以停。")),
+                h("div", { className: "gzs-confirm__acts" },
+                  h(Btn, {
+                    kind: "primary", small: true,
+                    on: () => { setAskBatch(false); onBatch(missing); },
+                  }, "开始出图"),
+                  h(Btn, { small: true, kind: "ghost", on: () => setAskBatch(false) }, "算了")))
+              : h("div", { style: { marginTop: 10 } },
+                h(Btn, { small: true, kind: "primary", disabled: Boolean(busy), on: () => setAskBatch(true) },
+                  `一键出齐缺图（${missing.length}）`)))
+            : h("div", { className: "gzs-row", style: { marginTop: 10, gap: 8, flexWrap: "wrap" } },
+              h(Btn, {
+                small: true, kind: "primary", disabled: Boolean(busy),
+                title: "出图要先有 prompt，而 prompt 是 AI 写的：点一下把话递进左栏",
+                on: () => onAsk?.(`【新媒体工作台】${String(article.title || "这一篇").slice(0, 24)} · 这几张缺图还没有出图 prompt。请按每段的小标题与正文，给${needPrompt} 个槽位各写一句出图 prompt（主体 + 场景 + 光线 + 色调，不要写「高级感」这类形容词），写完我再一键出图。`),
+              }, `让 Agent 先写 ${needPrompt} 张的 prompt`),
+              h("span", { className: "gzs-hint" }, "出图必须带 prompt；prompt 由 AI 写，写好后这里就能一键出齐。")))
+          : null);
     }
 
-    /** QA 列表渲染。空的时候说「这项没有拦路的问题」，而不是空白。 */
-    function qaItems(items) {
-      if (!items || !items.length) {
-        return h("div", { className: "gzs-hint", style: { padding: "4px 0" } }, "这项暂时没有问题。");
-      }
-      return items.map((item, index) => h("div", { key: `${item.id}-${index}`, className: `gzs-qa gzs-qa--${item.level}` },
-        h("div", { className: "gzs-qa__t" }, item.title),
-        item.detail ? h("div", { className: "gzs-qa__d" }, item.detail) : null,
-        h("div", { className: "gzs-qa__f" }, `改法：${item.fix}`)));
-    }
 
-    /** 记忆账本：最近 40 条，按时间倒序。 */
-    function ledgerBlock(ledger, scope) {
-      const rows = (Array.isArray(ledger) ? ledger : [])
-        .filter((e) => !scope || !e.slot || e.slot === scope)
-        .slice(-40)
-        .reverse();
-      if (!rows.length) return h("div", { className: "gzs-hint" }, "账本还是空的——出图、改稿、切版本都会记进来。");
-      return h("div", { className: "gzs-ledger" }, rows.map((e, index) => h("div", { key: `${e.ts}-${index}`, className: "gzs-ledger__row" },
-        h("span", { className: "gzs-ledger__ts" }, ago(e.ts)),
-        h("span", { className: "gzs-ledger__txt" }, ledgerText(e)))));
-    }
+
+
 
     /** 一条账本事件的人话。 */
     /**
@@ -3709,9 +3816,33 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /** 手机预览要占的地方：375 手机宽度 + 中栏左右各 26 内边距。 */
-    const MID_NEED = PHONE_WIDTH + 52;
     /**
+     * 左栏对话绑哪个工作区（记本地）。
+     *
+     * 为什么要记：内嵌对话的 cwd 必须是宿主认得的某个工作区，否则输入框只会显示
+     * 「选择一个工作区开始」。自动挑的那个不一定就是用户想聊的那个（他可能有好几个仓），
+     * 所以给一个选择器，并把选择记住——不然每次打开面板都得重选一遍。
+     */
+    const CHAT_WS_KEY = "gzs.chatws.v1";
+    function readChatWorkspace() {
+      try {
+        const value = localStorage.getItem(CHAT_WS_KEY);
+        return typeof value === "string" ? value : "";
+      } catch {
+        return "";
+      }
+    }
+    function writeChatWorkspace(workspaceId) {
+      try {
+        if (workspaceId) localStorage.setItem(CHAT_WS_KEY, String(workspaceId));
+        else localStorage.removeItem(CHAT_WS_KEY);
+      } catch {
+        /* 隐私模式下写不进去：本次仍然生效，只是记不住 */
+      }
+    }
+
+    /** 手机预览要占的地方：375 手机宽度 + 中栏左右各 26 内边距。 */
+    const MID_NEED = PHONE_WIDTH + 52;    /**
      * 手动拖拽时中栏的**硬下限**（比 MID_NEED 低）。
      *
      * 为什么需要两个数：MID_NEED 是「够用」的标准，MID_FLOOR 是「还能看」的底线。
@@ -4089,7 +4220,8 @@ window.__ModuleLoader__.load({
       const [selected, setSelected] = React.useState("article");
       const [busy, setBusy] = React.useState(false);
       const [toast, setToast] = React.useState("");
-      const [creating, setCreating] = React.useState(false);
+      // 内置示例稿开着没有：只在空库首屏点得到。它是静态数据，不发请求、不落库。
+      const [exampleOpen, setExampleOpen] = React.useState(false);
       // 打开中的提案详情（含逐段对照）。只存一份：面板一次只让人看一份对照。
       const [proposalDetail, setProposalDetail] = React.useState(null);
       /**
@@ -4100,17 +4232,34 @@ window.__ModuleLoader__.load({
        * 注意：loadArticle 只负责取数据，不负责切视图；切视图由用户动作决定。
        */
       const [screen, setScreen] = React.useState("article");
-      // 内容线：公众号（工作台）+ 视频号（只读看板）。两条线共用一个面板，顶部一条切换。
+      /**
+       * 首屏落哪一屏，**只在第一次拿到数据时决定一次**。
+       *
+       * `screen` 的初值是 article，好让「库里有稿」的人一进来就在最近一篇上（和历史工作台一致）。
+       * 但库是空的时候，画面其实是首页（`!article` 那个分支），而 `screen` 还写着 article——
+       * 于是「空库首屏 → 对话里刚建了一篇 → 状态刷新」这一串会把整块界面**突然跳进三栏**，
+       * 用户手上还在首页读那句话。实测冒烟就是在这里对不上账。
+       * 所以：第一次加载是空库就明确落到 home，之后不再跟着数据自己跳；进哪篇由人点。
+       */
+      const landedRef = React.useRef(false);
+      React.useEffect(() => {
+        if (landedRef.current || boot.loading) return;
+        landedRef.current = true;
+        if (!(boot.list ?? []).length) setScreen("home");
+      }, [boot.loading, boot.list]);
+      // 内容线：公众号（做一篇稿）+ 视频号（做一期片）。两条线共用一个面板，顶部一条切换。
       const [channel, setChannel] = React.useState("article");
+      // 以前这里有一条「没配真源仓库就把频道拽回公众号」的自愈。它现在删掉了：
+      // 视频号那一栏**没配也能看**（八步步骤 + 怎么接），把人拽走反而是「我点了没反应」。
       // 视频号是自读盘的独立组件：换 key 即重新挂载 = 重新拉一次（「刷新」按钮用）
       const [videoEpoch, setVideoEpoch] = React.useState(0);
       /**
-       * 右栏检查器当前停在哪个 tab（证据 / 图 / 元信息）。
+       * 右栏检查器当前停在哪个 tab（本段 / 图 / 证据 / 元信息）。
        *
        * 状态放在这里而不是 Inspector 里：顶部那条「N 份提案待确认 · 去检查」要能把 tab
        * 切到对应面板。tab 藏在子组件里的话，跳转只能滚到空气。
        */
-      const [inspTab, setInspTab] = React.useState("evidence");
+      const [inspTab, setInspTab] = React.useState("section");
       /**
        * 左栏「原生对话」开不开。
        *
@@ -4122,14 +4271,10 @@ window.__ModuleLoader__.load({
       const [chatOpen, setChatOpen] = useChatOpen();
       /** 往期抽屉：点顶栏「往期」就地看仓库真源，不用离开当前稿件去首页。 */
       const [repoOpen, setRepoOpen] = React.useState(false);
-      /** 推草稿对话框：没配公众号时它就是配置向导，配好了就是推前自查。 */
-      const [pushOpen, setPushOpen] = React.useState(false);
-      /** 出图节点配置：首启向导第 2 步用。 */
-      const [nodeOpen, setNodeOpen] = React.useState(false);
       /** 「检查」抽屉：QA / 提案 / 清单 / 账本集中看，不再是独立视图。 */
       const [inspectOpen, setInspectOpen] = React.useState(false);
-      /** 「发布包」：一稿多投的出口（小红书 / 抖音 / 快手 出包复制，公众号直推）。 */
-      const [packOpen, setPackOpen] = React.useState(false);
+      /** 「步骤」抽屉：两条内容线各自要过哪几步。首页 / 单篇 / 视频号都能打开。 */
+      const [stepsOpen, setStepsOpen] = React.useState(false);
       // 抽屉开着时 Esc 关掉：不给这个键，人只能去点遮罩或按钮。
       React.useEffect(() => {
         if (!repoOpen) return undefined;
@@ -4144,6 +4289,13 @@ window.__ModuleLoader__.load({
         window.addEventListener?.("keydown", onKey);
         return () => window.removeEventListener?.("keydown", onKey);
       }, [inspectOpen]);
+      // 「步骤」抽屉同理。
+      React.useEffect(() => {
+        if (!stepsOpen) return undefined;
+        const onKey = (event) => { if (event?.key === "Escape") setStepsOpen(false); };
+        window.addEventListener?.("keydown", onKey);
+        return () => window.removeEventListener?.("keydown", onKey);
+      }, [stepsOpen]);
       // 跟随宿主主题：挂上去就采样背后的颜色；宿主换主题 / 换背景时重采。
       React.useEffect(() => {
         const root = colRefs.current.root;
@@ -4207,14 +4359,28 @@ window.__ModuleLoader__.load({
        * 数据目录（`~/.dsh/gzh-studio`），拿它当工作目录，宿主会认为「这个目录不是任何
        * 工作区」，于是对话区只显示一句「选择一个工作区开始」——实测踩过。
        */
-      const chatRoot = boot.pipelineRoot || boot.root || "";
+      // 没配 pipelineRoot 的人占绝大多数，而**没配就没有输入框**：首屏那句
+      // 「说一句话，它帮你从选题写到成稿」于是成了空话——点「开始写」，面板这边填不进去、
+      // 那边也没有输入框可填，用户看到的结论是「点了根本没反应」。
+      // 所以 cwd 按三档退：产线根 → 用户选过的工作区 → 宿主里第一个工作区。
       const useWorkspaces = typeof props?.useWorkspaces === "function" ? props.useWorkspaces : () => undefined;
       const workspaceItems = useWorkspaces((state) => state?.items);
+      const workspaceList = Array.isArray(workspaceItems) ? workspaceItems : [];
+      const [chatWsPick, setChatWsPick] = React.useState(readChatWorkspace);
+      const pickChatWorkspace = React.useCallback((workspaceId) => {
+        setChatWsPick(workspaceId);
+        writeChatWorkspace(workspaceId);
+      }, []);
+      const chatRoot = React.useMemo(() => {
+        if (boot.pipelineRoot) return boot.pipelineRoot;
+        const picked = workspaceList.find((item) => item?.workspaceId === chatWsPick);
+        return picked?.path || workspaceList[0]?.path || boot.root || "";
+      }, [boot.pipelineRoot, boot.root, chatWsPick, workspaceList]);
       const chatWorkspaceId = React.useMemo(() => {
         const target = normalizeChatPath(chatRoot);
         if (!target) return null;
-        return (workspaceItems ?? []).find((item) => normalizeChatPath(item?.path) === target)?.workspaceId ?? null;
-      }, [workspaceItems, chatRoot]);
+        return workspaceList.find((item) => normalizeChatPath(item?.path) === target)?.workspaceId ?? null;
+      }, [workspaceList, chatRoot]);
       const chatLine = channel === "video" ? "video" : "article";
       const chat = useChatSession(chatRoot || null, chatWorkspaceId, chatOpen, chatLine);
       const useSessionStatus = typeof props?.useSessionStatus === "function" ? props.useSessionStatus : () => undefined;
@@ -4252,7 +4418,7 @@ window.__ModuleLoader__.load({
         // 但文章还没拉回来时渲染的是 Home，根本没有 .gzs-body —— 那时 effect 抓到 null
         // 直接 return，等文章到了 body 出现，依赖不变就不会重跑，ResizeObserver 永远没挂上。
         // 结果 bodyW 恒为 0，autoCols 一路走兜底 252/336，面板窄一点右栏就被挤到外面。
-      }, [screen, channel, chatOpen, creating, Boolean(view?.article)]);
+      }, [screen, channel, chatOpen, Boolean(view?.article)]);
 
       /** 用户设过的优先；没设过就按可用宽度算。算完还要按当下空间夹一遍。 */
       const fitted = fitCols(cols, bodyW);
@@ -4277,11 +4443,24 @@ window.__ModuleLoader__.load({
        * 而不是指望人去发现还能横向滚。
        */
       const [bodyOver, setBodyOver] = React.useState(false);
+      /**
+       * 窄面板：放不下就**分段**（结构 / 成稿 / 检查器 三格一次看一格），不再横向滚。
+       *
+       * 需要的宽度要按**当前真的显示几栏**算：左栏收着的时候（对话一开就自动收起），
+       * 只要「427 预览 + 250 检查器 + 一条分隔条」= 684；左栏展开才是 891。
+       * 用固定 891 判会把 1600 这种明明放得下两栏的窗口也判成窄面板——
+       * 那正是"用户明明有大屏却被塞进标签页"的坏体验。
+       */
+      const needWidth = (railVisible ? COL_LIMITS.left.min + SPLIT_W : 0) + MID_NEED + COL_LIMITS.right.min + SPLIT_W;
+      const compact = bodyW > 0 && bodyW < needWidth + 9;
+      /** 分段模式下当前看哪一格。宽屏不用它。 */
+      const [pane, setPane] = React.useState("mid");
       React.useEffect(() => {
         const node = colRefs.current.body;
         if (!node) return;
-        setBodyOver(node.scrollWidth - node.clientWidth > 2);
-      }, [leftW, rightW, bodyW, chatOpen, screen, channel, creating]);
+        // 分段模式本来就不横滚，别再报"三栏放不下"
+        setBodyOver(compact ? false : node.scrollWidth - node.clientWidth > 2);
+      }, [leftW, rightW, bodyW, chatOpen, screen, channel, compact, railVisible]);
 
       const measure = (key, fallback) => {
         const node = colRefs.current[key];
@@ -4370,7 +4549,7 @@ window.__ModuleLoader__.load({
           if (f.month) qs.set("month", f.month);
           if (f.track) qs.set("track", f.track);
           const data = await getJson(`${ROUTES.state}${qs.toString() ? `?${qs}` : ""}`);
-          setBoot({ loading: false, error: "", list: data.articles ?? [], activity: data.activity ?? [], counts: data.counts ?? null, filters: data.filters ?? null, matched: data.matched ?? null, templates: data.templates ?? [], nodes: data.settings?.nodes ?? [], settings: data.settings ?? null, pipelineRoot: data.settings?.pipelineRoot ?? "", root: data.root ?? "", tracks: data.tracks ?? [] });
+          setBoot({ loading: false, error: "", list: data.articles ?? [], activity: data.activity ?? [], counts: data.counts ?? null, filters: data.filters ?? null, matched: data.matched ?? null, templates: data.templates ?? [], nodes: data.settings?.nodes ?? [], settings: data.settings ?? null, pipelineRoot: data.settings?.pipelineRoot ?? "", root: data.root ?? "", tracks: data.tracks ?? [], repoConfigured: data.repoConfigured === true });
           const nextId = keep && data.articles?.some((a) => a.id === activeId) ? activeId : (data.articles?.[0]?.id ?? "");
           if (nextId) await loadArticle(nextId);
           else setView(null);
@@ -4379,18 +4558,34 @@ window.__ModuleLoader__.load({
         }
       };
 
-      /** 拉单篇。 */
+      /**
+       * 请求序号：连着切篇时，**先发的可能后到**。
+       *
+       * 在「全部文章」里点两下，出一趟 A 一趟 B；B 先回、A 后回，A 的正文就会盖掉 B 的——
+       * 列表选中的是 B，中间显示 A，右栏检查器还跟着 A 的槽位跑，三处各指一篇。
+       * 用序号认「这份数据还是不是最后一次点击」：不是就整包丢掉，连 toast 都不弹
+       * （那次请求本来就已经不是用户想要的了）。
+       */
+      const loadSeq = React.useRef(0);
+
+      /** 拉单篇；返回这次的结果有没有真的落到视图上（被后来的请求顶掉时是 false）。 */
       const loadArticle = async (id) => {
-        if (!id) return;
+        if (!id) return false;
+        const seq = ++loadSeq.current;
         try {
           const data = await getJson(`${ROUTES.article}?id=${encodeURIComponent(id)}`);
+          if (seq !== loadSeq.current) return false;
           setView(data);
           setActiveId(id);
           setContext({ kind: "article", id, label: `${data.article?.title || id} · 公众号` });
           // 换文章（或刷新）后旧提案的对照已经不属于当前这篇，收起
           setProposalDetail(null);
+          return true;
         } catch (error) {
+          // 被顶掉的那次失败不要报：用户已经在看新的一篇了，弹「读文章失败」只会莫名其妙
+          if (seq !== loadSeq.current) return false;
           say(`读文章失败：${error.message}`);
+          return false;
         }
       };
 
@@ -4492,17 +4687,6 @@ window.__ModuleLoader__.load({
         setView((prev) => ({ ...prev, article: result.article, qa: result.qa }));
       });
 
-      /**
-       * 绑定/解绑流水线。
-       * 绑定走 `save` 的 pipeline patch —— 服务端在那一刻把正文哈希钉下来，
-       * 所以「绑完又改字」能被 `drift` 立刻看出来。
-       */
-      const onBindPipeline = (binding) => write(async () => {
-        const result = await postJson(ROUTES.save, { id: article.id, patch: { pipeline: binding } });
-        const fresh = await getJson(`${ROUTES.pipeline}?id=${article.id}`);
-        setView((prev) => ({ ...prev, article: result.article, qa: result.qa, pipeline: fresh }));
-      }, binding.episodeId ? "已绑定期号，状态是查盘得出的" : "已解绑");
-
       /** 重算状态：只读盘、不写盘。做完某一步点一下，就知道那道门过了没有。 */
       const onPipelineRefresh = () => write(async () => {
         const fresh = await getJson(`${ROUTES.pipeline}?id=${article.id}`);
@@ -4518,8 +4702,79 @@ window.__ModuleLoader__.load({
         say(`${slot === "cover" ? "封面" : `第 ${sectionIndex(slot)} 段`} 出了 ${result.version.vid}${carried ? `，带上 ${carried} 条反馈` : ""}`);
       }, "出图完成");
 
-      const onPick = (slot, vid) => write(async () => {
-        const result = await postJson(ROUTES.pick, { id: article.id, slot, vid });
+      /**
+       * 一键出齐缺图：**串行**一张一张出，看得见进度，能中途停。
+       *
+       * 为什么要有：一篇 6 段的稿，逐格点要 7 次，而这是 11 步里唯一的纯体力活
+       * （写稿、改稿、合并都由 Agent 做）。为什么串行不发并行：出图是**花额度**的动作，
+       * 并行发出去人既看不清进度、又没法在第二张失败时停下来。
+       * 为什么不去覆盖旧版：只挑「当前没有图」的槽位，已有的版本一张都不动。
+       */
+      const batchRef = React.useRef({ stop: false });
+      const [batch, setBatch] = React.useState(null);
+      const generateMissing = (slots) => {
+        const list = Array.isArray(slots) ? slots.filter(Boolean) : [];
+        if (!list.length || !article) return;
+        batchRef.current = { stop: false };
+        const total = list.length;
+        setBusy(true);
+        (async () => {
+          let done = 0;
+          let failed = "";
+          for (const slot of list) {
+            if (batchRef.current.stop) break;
+            batchRef.current.last = slot;
+            setBatch({ total, done, current: slot });
+            try {
+              await postJson(ROUTES.generate, {
+                id: article.id,
+                slot,
+                size: slot === "cover" ? "900x383" : "1024x576",
+              });
+              done += 1;
+              // 每张之后立刻刷新：进度不只是数字，是"真的多了一张图"
+              await loadArticle(article.id);
+            } catch (error) {
+              failed = String(error?.message ?? error);
+              break;
+            }
+          }
+          setBatch(null);
+          setBusy(false);
+          const label = (slot) => (slot === "cover" ? "封面" : `第 ${sectionIndex(slot)} 段`);
+          if (failed) {
+            say(`出图停在「${label(batchRef.current.last ?? "")}」：${failed}。已经出好的 ${done} 张都在`);
+          } else if (batchRef.current.stop) {
+            say(`已停下：出了 ${done}/${total} 张，剩下的点「一键出齐」接着来`);
+          } else {
+            say(`${total} 张出齐了（${done} 张本次生成）`);
+          }
+        })();
+      };
+
+      /**
+       * 删掉这一篇：**移到回收站，不硬删**（宿主侧 `rename` 到 `~/.dsh/gzh-studio/trash/`）。
+       * 不做撤销栈：想找回自己搬回去就行，这比"删了还能撤销 5 秒"可靠。
+       * 宿主还没重启时这条路由不存在（404），要说清而不是假装删了。
+       */
+      const onRemove = (id) => write(async () => {
+        try {
+          await postJson(ROUTES.remove, { id: id ?? article?.id });
+        } catch (error) {
+          if (Number(error?.status) === 404) {
+            say("删稿这条路由还没生效：重启一次 dsh web 之后才能删（这篇没动）");
+            return;
+          }
+          throw error;
+        }
+        setView(null);
+        setActiveId("");
+        setScreen("home");
+        await loadState(true);
+        say("已移到回收站（~/.dsh/gzh-studio/trash/），想找回可以搬回来");
+      });
+
+      const onPick = (slot, vid) => write(async () => {        const result = await postJson(ROUTES.pick, { id: article.id, slot, vid });
         setView((prev) => ({ ...prev, article: result.article, qa: result.qa }));
         say(`当前版本切到 ${vid}`);
       });
@@ -4619,28 +4874,71 @@ window.__ModuleLoader__.load({
         say(confirmed ? "提案已确认，正文已写入" : `提案已驳回${quote ? `：${quote}` : ""}`);
       });
 
-      const onCreate = (form) => write(async () => {
-        const result = await postJson(ROUTES.create, form);
-        setCreating(false);
+      /**
+       * 新建 = **建一张空白稿，然后请 AI 给几个方向**。
+       *
+       * 这里原来是一张表单（内容类型 / 标题 / 讲给谁 / 带走什么 / 先摆几段 / 模板）。
+       * 用户 2026-11-07 的原话是「从零开始填这样的动作不要有，我们是让 AI 生成的，
+       * 标题人物文案所有步骤都是 AI 写、AI 推荐，人只做选择题」，而且那张表看起来
+       * 「像在做 PPT，不像做文章」。所以表单整张删掉：
+       * 点一下 = 建一张空白稿 + 把「先给我三个方向，我选一个」递进左栏对话。
+       * 人接下来只做选择，不做填空。
+       */
+      const onCreate = () => write(async () => {
+        const result = await postJson(ROUTES.create, {
+          title: "",
+          audience: "",
+          takeaway: "",
+          // 先摆三段只是给「逐段出图」一个位置，写成什么样由 Agent 定；后面它会自己增删。
+          sections: 3,
+          template: boot.settings?.defaultTemplate || "business",
+          track: "",
+        });
         await loadState();            // 列表要有这条
         await loadArticle(result.article.id);
         setSelected("article");
         setScreen("article");
-        say("建好了：先写讲稿，再逐段出图");
+        chatOpenStore.set(true);
+        // 不替人按回车：话填进去，发不发由人决定（面板自己发出去的消息，人在输入框里改不了）。
+        bringToChat([
+          `【新媒体工作台】刚建了一张空白稿（${result.article?.id ?? "新稿"}）。`,
+          "别问我怎么填表：先给我 3 个选题方向，每个一行写清「标题 / 讲给谁 / 想让人带走什么」，",
+          "我选一个，你再动笔。",
+          // 归类靠这一句：类型不会自动推断，不提醒就全落「通用」。
+          // 只让它**顺手带**，不设成必填——「一句话就能开始写」的前提不能破。
+          (boot.tracks ?? []).length
+            ? `动笔时顺手把这批稿归到内容类型里（建稿或保存时带 track，值从这些 id 里选：${(boot.tracks ?? []).map((t) => t.id).slice(0, 12).join("/")}${(boot.tracks ?? []).length > 12 ? " 等" : ""}）；判断不了就留空当「通用」，别瞎猜。`
+            : "",
+        ].filter(Boolean).join("")).then((sent) => say(sent.ok
+          ? "已经请它给方向了：左栏看一眼，按回车发出去"
+          : `没带过去：${sent.reason}。直接在左栏说「给我 3 个选题方向」也行`));
       });
 
       const onExport = (format) => {
         if (!article) return;
         const url = `${ROUTES.export}?id=${encodeURIComponent(article.id)}&format=${format}`;
-        // 先取文本：能复制就复制（公众号后台要粘），同时给下载
+        /**
+         * 先取文本：能复制就复制（公众号后台要粘），同时给下载。
+         *
+         * `writeText` 返回的是 Promise，**不能同步当成成功了**：
+         * - 页面没聚焦（点了别处、切了窗口）时它会 reject，
+         *   而 `writeText?.(body)` 的返回值没人接 → 控制台一条「Uncaught (in promise) NotAllowedError」；
+         * - 更要紧的是以前 `copied = Boolean(navigator.clipboard?.writeText)` 只要 API 存在就报「已复制」，
+         *   实际没复制进去，用户去公众号后台粘贴是空的。**说做过的事，必须真做过。**
+         */
         fetch(url, { credentials: "same-origin" })
           .then((r) => (r.ok ? r.text() : Promise.reject(new Error(`${r.status}`))))
-          .then((body) => {
+          .then(async (body) => {
             let copied = false;
-            try {
-              navigator.clipboard?.writeText?.(body);
-              copied = Boolean(navigator.clipboard?.writeText);
-            } catch { copied = false; }
+            const clip = navigator.clipboard;
+            if (clip && typeof clip.writeText === "function") {
+              try {
+                await clip.writeText(body);
+                copied = true;
+              } catch {
+                copied = false; // 无焦点 / 没权限：不报错，只是这半句提示换成「请手动复制」
+              }
+            }
             const blob = new Blob([body], { type: "text/plain;charset=utf-8" });
             const href = URL.createObjectURL(blob);
             const a = document.createElement("a");
@@ -4648,12 +4946,74 @@ window.__ModuleLoader__.load({
             a.download = `${article.id}.${format === "md" ? "md" : format === "checklist" ? "txt" : "html"}`;
             a.click();
             setTimeout(() => URL.revokeObjectURL(href), 4000);
-            say(copied ? "已复制到剪贴板，也下载了一份" : "已下载（浏览器不让写剪贴板）");
+            say(copied ? "已复制到剪贴板，也下载了一份" : "已下载。浏览器没让写剪贴板（页面未聚焦时常见），从下载的文件里复制即可。");
           })
           .catch((error) => say(`导出失败：${error.message}`));
       };
 
       // ── 顶栏 ──
+      /**
+       * 「参数」= 右栏元信息的**只读**视图。
+       *
+       * 这里只负责把人送到「现在是什么在那儿」，并把那一栏滚进视野 + 闪一下。
+       * 改哪一项点那一行的「让 Agent 改」——话会填进左栏对话。右栏不出输入框。
+       */
+      const [metaFlash, setMetaFlash] = React.useState(false);
+      const openMeta = () => {
+        setInspTab("meta");
+        setMetaFlash(true);
+        // 分段模式下右栏可能不是当前那一格：先切过去，否则"点了没反应"
+        if (compact) setPane("right");
+        const node = colRefs.current.right;
+        try { node?.scrollIntoView?.({ block: "nearest", inline: "nearest" }); } catch { /* 老浏览器没有 */ }
+        say("参数是只读的：要改哪一项，点它右边的「让 Agent 改」");
+        setTimeout(() => setMetaFlash(false), 1400);
+      };
+      /**
+       * 公众号草稿箱：配没配、推没推。
+       *
+       * 只推到**草稿箱**——发表仍然要人去公众号后台点。这条边界是产品口径，不是技术限制：
+       * 插件能帮到「内容进后台」，但不能替人按那个不可撤销的按钮。
+       * 配置不走面板（右栏是看板、也不该收密钥）：没配时点按钮会把一句话递进左栏，
+       * 让 Agent 去写 ~/.dsh/gzh-studio/wechat.json。
+       */
+      const [wx, setWx] = React.useState({ usable: false, configured: false, appId: "", author: "", missing: true });
+      const [wxBusy, setWxBusy] = React.useState(false);
+      React.useEffect(() => {
+        let live = true;
+        (async () => {
+          try {
+            const data = await getJson(ROUTES.wechatStatus);
+            if (live) setWx({ usable: data?.usable === true, configured: data?.configured === true, appId: data?.appId ?? "", author: data?.author ?? "", missing: false });
+          } catch (error) {
+            // 宿主还没重启时这条路由是 404：不说清楚，用户会以为"配置丢了"。
+            if (live) setWx({ usable: false, configured: false, appId: "", author: "", missing: true, error: Number(error?.status) === 404 ? "宿主还没重启：草稿箱路由不存在" : String(error?.message ?? error) });
+          }
+        })();
+        return () => { live = false; };
+      }, [article?.id]);
+
+      const askWechatConfig = () => {
+        bringToChat([
+          "【新媒体工作台】帮我配公众号草稿箱：把 AppID 与 AppSecret 写进 ~/.dsh/gzh-studio/wechat.json",
+          "（字段 appId / appSecret，可选 author），别把密钥回显在对话里。配好我刷新一次就能推。",
+        ].join("")).then((result) => say(result.ok
+          ? "已把配置方法递进左栏对话，按回车让它去做"
+          : `没带过去：${result.reason}`));
+      };
+
+      const pushDraft = () => {
+        if (!article || wxBusy) return;
+        setWxBusy(true);
+        postJson(ROUTES.push, { id: article.id })
+          .then((result) => say(`已推进公众号草稿箱（media_id ${String(result?.mediaId ?? "").slice(0, 12)}…）：发表仍要你去后台点`))
+          .catch((error) => {
+            if (Number(error?.status) === 404) say("推送这条路由还没生效：重启一次 dsh web 之后才能推（这篇没动）");
+            else say(`没推上去：${error?.message ?? error}`);
+          })
+          .finally(() => setWxBusy(false));
+      };
+
       const pendingCount = (view?.proposals ?? []).filter((p) => p.status === "waiting-user").length;
       const qaChip = qa
         ? h("span", { style: { cursor: "pointer" }, title: "打开「检查」：全部问题、提案对照、清单与账本", onClick: () => setInspectOpen(true) },
@@ -4665,25 +5025,42 @@ window.__ModuleLoader__.load({
       let head;
       // 内容线切换：公众号是「在改的稿」，视频号是「仓库里做到哪一步」。
       // 放顶栏最左，因为它是**换频道**，比换篇更粗一级。
-      const chan = h("div", { className: "gzs-chan", title: "切内容线" },
-        [["article", "公众号"], ["video", "视频号"]].map(([key, label]) => h("button", {
+      //
+      // 视频号**常驻**（2026-11-07 改）：以前只在配了真源仓库时才出现，理由是
+      // 「没配的时候点进去整页都在解释为什么什么都没有」。但那条规则的真实后果是——
+      // 用户问「我的视频面板呢？」。一个功能藏起来，用户不会得出「我去配个仓库」，
+      // 只会得出「这插件没有视频」。所以它一直在这儿，没配的时候点进去给的是
+      // 「八步是哪八步 + 怎么接上真源」，而不是一页空解释。
+      const lines = [["article", "公众号"], ["video", "视频号"]];
+      const chan = h("div", { className: "gzs-chan", title: "切内容线：公众号（一篇稿）/ 视频号（一期片）" },
+        lines.map(([key, label]) => h("button", {
           key,
           className: `gzs-chan__b ${channel === key ? "gzs-chan__b--on" : ""}`,
+          title: key === "video" && !boot.repoConfigured ? "视频号：八步步骤已就位，真源仓库还没接（接上就能看期）" : undefined,
           onClick: () => {
             setChannel(key);
             setContext(key === "video"
               ? { kind: "video", id: "", label: "视频号列表" }
               : { kind: "article", id: activeId, label: `${article?.title || activeId || "新媒体工作台"} · 公众号` });
           },
-        }, label)));
-      if (screen === "home") {
-        // 首页自带「新建」按钮，顶栏不再重复；这里只留内容线、标题和刷新
+        }, label, key === "video" && !boot.repoConfigured ? h("span", { className: "gzs-chan__dot", title: "真源仓库未配置" }) : null)));
+      // 顶栏跟**画面**走，不跟状态走：`screen` 初值是 article，但库是空的时候画面是首页。
+      // 于是顶栏会渲染出一整排「检查 / 参数 / 出稿」——它们都绑在 article 上，此刻全是死的。
+      // 点了没反应，用户不会去怪「状态和画面不同步」，只会觉得这台机器坏了。
+      if (screen === "home" || !article) {
+        // 首页自带「新建」按钮，顶栏不再重复；这里只留内容线、步骤、标题和刷新
         head = h("div", { className: "gzs-head" },
           h("button", {
             className: `gzs-chattoggle${chatOpen ? " is-on" : ""}`,
             title: chatOpen ? "收起左侧原生对话，让面板占满" : "在左侧打开 DSH 原生对话（同一条会话）",
             onClick: toggleChat,
           }, chatOpen ? "◧ 对话" : "▢ 对话"),
+          h("button", {
+            className: `gzs-chattoggle${stepsOpen ? " is-on" : ""}`,
+            title: "做一篇稿 / 一期视频要过哪几步、现在卡在哪",
+            "aria-pressed": stepsOpen ? "true" : "false",
+            onClick: () => setStepsOpen((v) => !v),
+          }, "≡ 步骤"),
           chan,
           h("span", { className: "gzs-title" }, "新媒体工作台"),
           h("div", { className: "gzs-spacer" }),
@@ -4701,20 +5078,29 @@ window.__ModuleLoader__.load({
               title: chatOpen ? "收起左侧原生对话，让面板占满" : "在左侧打开 DSH 原生对话（同一条会话）",
               onClick: toggleChat,
             }, chatOpen ? "◧ 对话" : "▢ 对话"),
-            isArticle && screen === "article"
+            // 「步骤」= 全局步骤抽屉。收起左栏是另一件事（「▤ 左栏」）：
+            // 前者回答「要过哪几关」，后者只是布局。两个都被点过却没反应的功能，
+            // 一定有一个被放错了位置。
+            h("button", {
+              className: `gzs-chattoggle${stepsOpen ? " is-on" : ""}`,
+              title: "做一篇稿 / 一期视频要过哪几步、现在卡在哪",
+              "aria-pressed": stepsOpen ? "true" : "false",
+              onClick: () => setStepsOpen((v) => !v),
+            }, "≡ 步骤"),
+            isArticle && screen === "article" && !compact
               ? h("button", {
                 className: `gzs-chattoggle${railVisible ? " is-on" : ""}`,
-                title: railVisible ? "收起左栏（步骤与结构），把宽度让给预览" : "展开左栏（步骤与结构）",
+                title: railVisible ? "收起左栏（本期进度与结构），把宽度让给预览" : "展开左栏（本期进度与结构）",
                 "aria-pressed": railVisible ? "true" : "false",
                 onClick: () => setRailOpen((v) => !v),
-              }, "≡ 步骤")
+              }, "▤ 左栏")
               : null,
             chan,
             isArticle
               ? h(Btn, {
                 small: true, kind: "ghost", title: "全部文章（含往期）",
                 // 回首页时顺手收起往期抽屉：否则它会盖在首页上，像「点了没反应」。
-                on: () => { setRepoOpen(false); setPushOpen(false); setScreen("home"); loadState(true).catch(() => {}); },
+                on: () => { setRepoOpen(false); setScreen("home"); loadState(true).catch(() => {}); },
               }, "全部文章")
               : null),
           h("div", { className: "gzs-headgroup gzs-headgroup--mid" },
@@ -4724,7 +5110,9 @@ window.__ModuleLoader__.load({
                 className: "gzs-select",
                 title: "换一篇",
                 value: activeId,
-                onChange: (e) => { setActiveId(e.target.value); loadArticle(e.target.value).then(() => setScreen("article")); setSelected("article"); },
+                // 切篇之后才切 screen：慢响应被后来的请求顶掉时（applied 为 false），
+                // 别把用户拽去一篇根本不是他最后选的那篇
+                onChange: (e) => { setActiveId(e.target.value); loadArticle(e.target.value).then((applied) => { if (applied) setScreen("article"); }); setSelected("article"); },
               }, boot.list.map((a) => h("option", { key: a.id, value: a.id }, `${a.title || "（无标题）"} · ${a.images ?? 0} 图`)))
               : null,
             // 赛道：换赛道就是换一套合规口径（禁用词 + 必须声明）与默认长相。
@@ -4770,24 +5158,43 @@ window.__ModuleLoader__.load({
             isArticle && screen === "article"
               ? h(Btn, { small: true, title: "QA / 提案 / 清单 / 账本集中看", on: () => setInspectOpen(true) }, "检查")
               : null,
-            isArticle && screen === "article"
-              ? h(Btn, { small: true, kind: "ghost", title: "多平台发布包：小红书 / 抖音 / 快手 的规格与文案", on: () => setPackOpen(true) }, "发布包")
-              : null,
+            // 「参数」：内容类型 / 模板 / 讲给谁 / 带走什么 / 标题摘要——建完之后随时改的地方。
+            // 以前这几项只在「新建」时填得进，想改等于重来；参数卡就是补这个洞。
+            // 「参数」= 右栏「元信息」，不是那个检查抽屉。
+            //
+            // 踩过（0.3.1 冒烟）：这里原来是 setInspTab("meta") + setInspectOpen(true)——
+            // 抽屉里渲染的是 Governance（QA / 提案 / 账本），它根本不认 tab，
+            // 于是「参数」打开了一屏**没有任何输入框**的东西，而 tooltip 还在承诺
+            // 「内容类型 / 模板 / 讲给谁 / 带走什么」。那就是一个假按钮。
+            // 现在它真的把右栏切到元信息，并闪一下边框，让人看见「东西在那儿」。
             isArticle && screen === "article"
               ? h(Btn, {
-                small: true, kind: "primary",
-                disabled: !article,
-                title: "推到公众号草稿箱：先自查字符数与图片，再推",
-                on: () => setPushOpen(true),
-              }, "推草稿")
+                small: true, kind: "ghost",
+                title: "在右栏「元信息」里看：标题 / 摘要 / 讲给谁 / 带走什么 / 标签 / 模板 / 内容类型（只读；要改点那一行的「让 Agent 改」）",
+                on: openMeta,
+              }, "参数")
               : null,
+            // 推草稿箱：只推到「草稿箱」，发表仍然要人去公众号后台点。
+            // 配置不是在这里填（右栏只看、面板不收密钥）：点「未配」那颗，会把一句话递进左栏，
+            // 让 Agent 去写 ~/.dsh/gzh-studio/wechat.json。
             isArticle && screen === "article"
-              ? h("div", { className: "gzs-seg", title: "出稿：HTML 直接粘公众号后台；Markdown 给别的工具；图片清单给设计" },
-                h("span", { className: "gzs-eyebrow", style: { padding: "0 4px 0 9px" } }, "出稿"),
-                h(Btn, { small: true, disabled: !article, on: () => onExport("html") }, "HTML"),
-                h(Btn, { small: true, disabled: !article, on: () => onExport("md") }, "Markdown"),
-                h(Btn, { small: true, disabled: !article, on: () => onExport("checklist") }, "图片清单"))
+              ? h(Btn, {
+                small: true,
+                kind: wx.usable ? "primary" : "ghost",
+                disabled: !article || Boolean(busy) || wxBusy,
+                title: wx.usable
+                  ? "推到公众号草稿箱（不是发表；发表仍要你去后台点）"
+                  : "还没配公众号：点一下，让 Agent 去写 AppID / AppSecret",
+                // 三种状态说三句话：路由没生效 / 没配 / 配好了
+                on: () => {
+                  if (wx.missing) { say("推送要重启一次 dsh web 才会生效（这次是旧的宿主进程）"); return; }
+                  if (!wx.usable) { askWechatConfig(); return; }
+                  pushDraft();
+                },
+              }, wxBusy ? "推送中…" : (wx.usable ? "推草稿箱" : "推草稿箱（未配）"))
               : null,
+            // 出稿（HTML / Markdown / 图片清单）只留正文 meta 行那颗「导出 ▾」：
+            // 同一件事摆两处，窄窗口下就是两行按钮挤掉标题。2026-11-08 删上面那组。
             h(Btn, {
               small: true, kind: "ghost",
               title: isArticle ? "重新读工作台数据" : "重新读仓库期目录",
@@ -4822,7 +5229,14 @@ window.__ModuleLoader__.load({
         onJump: (scope) => { setSelected(scope || "article"); setScreen("article"); setInspectOpen(false); },
       };
       let body;
-      if (channel === "video") {
+      if (exampleOpen) {
+        // 示例优先于一切：它是从空库首屏点进来的，看完就关。
+        body = h(ExampleSheet, {
+          templates,
+          onClose: () => setExampleOpen(false),
+          onStart: () => { setExampleOpen(false); onCreate(); },
+        });
+      } else if (channel === "video") {
         // 视频号线不依赖 boot（它读的是仓库期目录），所以放在最前面：
         // 公众号那边 loadState 失败也不该拖累看板。
         body = h(VideoBoard, { refreshKey: videoEpoch, onContext: setContext });
@@ -4839,8 +5253,6 @@ window.__ModuleLoader__.load({
           h("div", null, "读不到数据："),
           h("div", { className: "gzs-hint" }, boot.error),
           h(Btn, { small: true, on: () => loadState(true) }, "重试"));
-      } else if (creating) {
-        body = h(NewArticle, { templates, tracks: boot.tracks, onCreate, onCancel: () => setCreating(false), busy });
       } else if (screen === "home" || !article) {
         // 打开就是工作台（和历史工作台一致）：进面板直接落到最近一篇的三栏，
         // 不再先给一个「首页」让人再点一次。`全部文章` 是顶部那个按钮，
@@ -4854,12 +5266,25 @@ window.__ModuleLoader__.load({
           matched: boot.matched,
           busy,
           tracks: boot.tracks,
-          onConfigureNodes: () => setNodeOpen(true),
-          onConfigureWechat: () => setPushOpen(true),
+          // 卡上的模板要显示中文名，不能把 id（business）直接摆给人看
+          templates: boot.templates,
+          onOpenExample: () => setExampleOpen(true),
           // 改筛选就重新拉一次：计数基于全量、列表基于筛选，两者必须来自同一次读取
           onFilter: (next) => loadState(true, next).catch(() => {}),
-          onOpen: (id) => { loadArticle(id).then(() => setScreen("article")); setSelected("article"); },
-          onCreate: () => setCreating(true),
+          // 同一类错序：首页点开一篇，慢响应回来时人可能已经在看别的稿了
+          onOpen: (id) => { loadArticle(id).then((applied) => { if (applied) setScreen("article"); }); setSelected("article"); },
+          onCreate,
+          // 首屏那句「开始写」把字填进左栏对话——所以它得知道左栏在不在、有没有会话。
+          // 对话**收着**的时候不能报「对话还没接上」：那时它压根没开会话，
+          // 真实情况是「你可以展开它」，不是「它坏了」。两种都不好用时才真的提示。
+          chatOpen,
+          chatReady: chatOpen ? Boolean(chat.reference) : true,
+          onOpenChat: () => chatOpenStore.set(true),
+          // 首屏也能直接切到视频号：两条线都在这一个面板里，第一页就该让人知道
+          onGoVideo: () => {
+            setChannel("video");
+            setContext({ kind: "video", id: "", label: "视频号列表" });
+          },
         });
       } else {
         const hasBody = Boolean((article?.sections ?? []).some((s) => String(s?.body ?? "").trim()));
@@ -4879,116 +5304,154 @@ window.__ModuleLoader__.load({
           roughProgress: { exported: (ledger ?? []).some((row) => row?.type === "export") },
           onOpenObs: () => setInspectOpen(true),
           onRefresh: onPipelineRefresh,
-          onBind: onBindPipeline,
         };
-        body = h("div", { className: "gzs-body", ref: (node) => { colRefs.current.body = node; } },
-          // 左栏：本期步骤优先（未绑期号时按稿件推断，结构列表折叠在底部）
-          h("div", {
-            className: "gzs-col gzs-col--left",
-            ref: (node) => { colRefs.current.left = node; },
-            // 用户没拖过就不写内联固定值之外的东西：宽度仍来自 autoCols（跟着可用空间走）
-            // 收起时不写 display:none 到 CSS 里，而是就地隐藏——DOM 还在，
-            // 组件状态（步骤展开到哪、结构折没折）不丢，收回来还是原样。
-            style: railVisible ? { flexBasis: `${leftW}px` } : { flexBasis: `${leftW}px`, display: "none" },
-          },
-            h(StepRail, {
-              view, article, selected,
-              onSelect: setSelected,
-              onAddSection,
-              onBind: onBindPipeline,
-              busy,
-              root: boot.pipelineRoot ?? "",
-            })),
-
-          railVisible
-            ? h(Splitter, {
-              label: "本栏与中间预览之间",
-              onStart: () => measure("left", leftW),
-              onDrag: (want) => dragCol("left", want),
-              onReset: () => resetCol("left"),
-            })
-            : null,
-
-          // 中栏：标题 + 一行元信息 + 成稿 / 手机预览 / 排版
-          h("div", {
-            className: "gzs-col gzs-col--mid",
-            /**
-             * 中栏的下限有两档，靠出处不同：
-             * - 自动布局（用户没拖过任何一栏）→ CSS 的 min-width:427 兜着，
-             *   手机预览必须是原尺寸，宁可整排横向滚动；
-             * - 用户拖过某一栏 → 这一栏是明确指令，中栏只需守住 MID_FLOOR(300)，
-             *   否则拖到一半被 427 顶回来，手感就是「拖不动」。
-             */
-            style: wantsManual ? { minWidth: `${MID_FLOOR}px` } : undefined,
-          },
-            h(Stage, {
-              article, templates, selected,
-              onSelect: setSelected,
-              onExport,
-              // 预览里的「重出 / 换版」：直连已有的出图与切版动作，不另造一条写入路径。
-              onRegenerate: (slot) => onGenerate({ slot }),
-              onPickVersion: onPick,
-              busy,
-            })),
-
-          h(Splitter, {
-            label: "中间预览与检查器之间",
-            onStart: () => measure("right", rightW),
-            onDrag: (want) => dragCol("right", want),
-            onReset: () => resetCol("right"),
-            // 分隔条在右栏左边：往右拖 = 把右栏挤窄
-            invert: true,
-          }),
-
-          // 右栏：检查器（证据 / 图 / 元信息）
-          // 栏头只写「检查器」不写范围：范围（整篇 / 封面 / 第 N 段）就在下面一行由检查器自己报，
-          // tab 名也在下面，重复一遍只是噪音。
-          h("div", {
-            className: "gzs-col gzs-col--right",
-            ref: (node) => { colRefs.current.right = node; },
-            style: { flexBasis: `${rightW}px` },
-          },
-            h("div", { className: "gzs-colhead" }, "检查器"),
-
-            // 右栏很长（流水线 + 十道门 + 提案 + QA + 账本 + 图）。
-            // 有提案待确认时，提案卡会落在视口外面——人在「整篇」视图里根本看不见。
-            // 所以顶部加一条粘性跳转条：只要有待确认，就在一进来能看到的位置给入口。
-            pendingProposals.length
-              ? h("button", {
-                className: "gzs-jump",
-                onClick: () => {
-                  // 提案卡已经不在右栏了（「意见」栏去掉，统一进「检查」抽屉）：
-                  // 点它就是打开抽屉并展开第一份待确认的对照。
-                  setInspectOpen(true);
-                  const first = pendingProposals[0];
-                  if (first && !proposalDetail) onOpenProposal(first.pid);
-                },
+        // 三个栏位先各自建好，再按「放不放得下」排成三栏或分段——
+        // 同一份 JSX 走两条版式，不复制一套代码（复制出来的两套迟早不一致）。
+        const railNode = h(StepRail, {
+          view, article, selected,
+          onSelect: setSelected,
+          onAddSection,
+          busy,
+        });
+        const stageNode = h(Stage, {
+          article, templates, selected,
+          onSelect: setSelected,
+          onExport,
+          // 预览里的「重出 / 换版」：直连已有的出图与切版动作，不另造一条写入路径。
+          onRegenerate: (slot) => onGenerate({ slot }),
+          onPickVersion: onPick,
+          busy,
+        });
+        const inspNode = h(React.Fragment, null,
+          h("div", { className: "gzs-colhead" }, "检查器"),
+          // 右栏很长（流水线 + 十道门 + 提案 + QA + 账本 + 图）。
+          // 有提案待确认时，提案卡会落在视口外面——人在「整篇」视图里根本看不见。
+          // 所以顶部加一条粘性跳转条：只要有待确认，就在一进来能看到的位置给入口。
+          pendingProposals.length
+            ? h("button", {
+              className: "gzs-jump",
+              onClick: () => {
+                // 提案卡已经不在右栏了（「意见」栏去掉，统一进「检查」抽屉）：
+                // 点它就是打开抽屉并展开第一份待确认的对照。
+                setInspectOpen(true);
+                const first = pendingProposals[0];
+                if (first && !proposalDetail) onOpenProposal(first.pid);
               },
-                h("span", { className: "gzs-dot gzs-dot--busy" }),
-                `${pendingProposals.length} 份提案待确认`,
-                h("span", { className: "gzs-jump__go" }, "去「检查」看对照 →"))
+            },
+              h("span", { className: "gzs-dot gzs-dot--busy" }),
+              `${pendingProposals.length} 份提案待确认`,
+              h("span", { className: "gzs-jump__go" }, "去「检查」看对照 →"))
+            : null,
+          h(Inspector, {
+            // `key` 绑文章 id：换文章时重挂载，Inspector 里的局部状态（出图确认标记、
+            // 反馈草稿、节点选择）跟着重置。不加 key 会跨文章泄漏——
+            // 在 A 篇确认过出图，切到 B 篇就不问了，而 B 篇一次都没确认过。
+            key: article.id,
+            tab: inspTab, onTab: setInspTab,
+            article, selected, templates, nodes, qa, ledger, busy,
+            onSaveArticle, onSaveSection, onSaveSlot, onGenerate, onPick, onFeedback, onTemplate,
+            onSelect: setSelected, onDeleteSection,
+            // 右栏是看板：里面每一颗「让 Agent 改」都从这里把话填进左栏对话（只填不发）
+            onAsk: (text) => {
+              bringToChat(text).then((result) => say(result.ok
+                ? "已把这句话填进左栏对话，补完按回车"
+                : `没带过去：${result.reason}。也可以直接在左栏说。`));
+            },
+            proposals: view?.proposals ?? [], proposalDetail,
+            onOpenProposal, onCloseProposal, onDecideProposal,
+            // 一键出齐缺图（串行、可中断、不覆盖旧版）
+            onBatch: generateMissing,
+            onRemove,
+            feedback: view?.feedback ?? null,
+            // 去 AI 味 / 审阅清单只报数（操作台在治理视图），所以只传数不传动作
+            deai: view?.deai ?? null,
+            reviews: view?.reviews ?? null,
+            pipeline: view?.pipeline ?? null,
+            track: view?.track ?? null,
+            pipeBlock,
+            onGovernance: () => setInspectOpen(true),
+          }));
+
+        if (compact) {
+          /**
+           * 窄面板（可用宽度放不下三栏）：**分段**，不横向滚。
+           *
+           * 1280 的窗口打开左栏对话后，工作区只剩 629px，而三栏最低要 891
+           * （左 200 + 中 427 + 右 250 + 两条分隔条 14）。原来靠横向滚动兜底，
+           * 滚动条一被藏起来，用户看到的就是"右边那一栏不见了"。
+           * 现在改成三格分段：一次看一格，整格满宽，不用滚。
+           */
+          body = h("div", {
+            className: "gzs-compact",
+            ref: (node) => {
+              colRefs.current.body = node;
+              colRefs.current.left = node;
+              colRefs.current.right = node;
+            },
+          },
+            h("div", { className: "gzs-panes", role: "tablist", "aria-label": "栏位" },
+              [["left", "结构"], ["mid", "成稿"], ["right", "检查器"]].map(([key, text]) => h("button", {
+                key, role: "tab", "aria-selected": pane === key ? "true" : "false",
+                className: `gzs-panes__b${pane === key ? " is-on" : ""}`,
+                onClick: () => setPane(key),
+              }, text))),
+            h("div", { className: "gzs-panes__wrap" },
+              h("div", { className: `gzs-pane${pane === "left" ? " is-on" : ""}` }, railNode),
+              h("div", { className: `gzs-pane gzs-pane--mid${pane === "mid" ? " is-on" : ""}` }, stageNode),
+              h("div", {
+                className: `gzs-pane gzs-pane--right${pane === "right" ? " is-on" : ""}${metaFlash ? " gzs-col--flash" : ""}`,
+              }, inspNode)));
+        } else {
+          body = h("div", { className: "gzs-body", ref: (node) => { colRefs.current.body = node; } },
+            // 左栏：本期步骤优先（未绑期号时按稿件推断，结构列表折叠在底部）
+            h("div", {
+              className: "gzs-col gzs-col--left",
+              ref: (node) => { colRefs.current.left = node; },
+              // 用户没拖过就不写内联固定值之外的东西：宽度仍来自 autoCols（跟着可用空间走）
+              // 收起时不写 display:none 到 CSS 里，而是就地隐藏——DOM 还在，
+              // 组件状态（步骤展开到哪、结构折没折）不丢，收回来还是原样。
+              style: railVisible ? { flexBasis: `${leftW}px` } : { flexBasis: `${leftW}px`, display: "none" },
+            }, railNode),
+
+            railVisible
+              ? h(Splitter, {
+                label: "本栏与中间预览之间",
+                onStart: () => measure("left", leftW),
+                onDrag: (want) => dragCol("left", want),
+                onReset: () => resetCol("left"),
+              })
               : null,
 
-            h(Inspector, {
-              // `key` 绑文章 id：换文章时重挂载，Inspector 里的局部状态（出图确认标记、
-              // 反馈草稿、节点选择）跟着重置。不加 key 会跨文章泄漏——
-              // 在 A 篇确认过出图，切到 B 篇就不问了，而 B 篇一次都没确认过。
-              key: article.id,
-              tab: inspTab, onTab: setInspTab,
-              article, selected, templates, nodes, qa, ledger, busy,
-              onSaveArticle, onSaveSection, onSaveSlot, onGenerate, onPick, onFeedback, onTemplate,
-              onSelect: setSelected, onDeleteSection,
-              proposals: view?.proposals ?? [], proposalDetail,
-              onOpenProposal, onCloseProposal, onDecideProposal,
-              feedback: view?.feedback ?? null,
-              // 去 AI 味 / 审阅清单只报数（操作台在治理视图），所以只传数不传动作
-              deai: view?.deai ?? null,
-              reviews: view?.reviews ?? null,
-              pipeline: view?.pipeline ?? null,
-              track: view?.track ?? null,
-              pipeBlock,
-              onGovernance: () => setInspectOpen(true),
-            })));
+            // 中栏：标题 + 一行元信息 + 成稿 / 手机预览 / 排版
+            h("div", {
+              className: "gzs-col gzs-col--mid",
+              /**
+               * 中栏的下限有两档，靠出处不同：
+               * - 自动布局（用户没拖过任何一栏）→ CSS 的 min-width:427 兜着，
+               *   手机预览必须是原尺寸，宁可整排横向滚动；
+               * - 用户拖过某一栏 → 这一栏是明确指令，中栏只需守住 MID_FLOOR(300)，
+               *   否则拖到一半被 427 顶回来，手感就是「拖不动」。
+               */
+              style: wantsManual ? { minWidth: `${MID_FLOOR}px` } : undefined,
+            }, stageNode),
+
+            h(Splitter, {
+              label: "中间预览与检查器之间",
+              onStart: () => measure("right", rightW),
+              onDrag: (want) => dragCol("right", want),
+              onReset: () => resetCol("right"),
+              // 分隔条在右栏左边：往右拖 = 把右栏挤窄
+              invert: true,
+            }),
+
+            // 右栏：检查器（证据 / 图 / 元信息）。栏头只写「检查器」不写范围：
+            // 范围（整篇 / 封面 / 第 N 段）就在下面一行由检查器自己报，tab 名也在下面。
+            h("div", {
+              className: `gzs-col gzs-col--right${metaFlash ? " gzs-col--flash" : ""}`,
+              ref: (node) => { colRefs.current.right = node; },
+              style: { flexBasis: `${rightW}px` },
+            }, inspNode));
+        }
       }
 
       return h("div", {
@@ -5010,6 +5473,11 @@ window.__ModuleLoader__.load({
               onReset: chat.reset,
               onClose: toggleChat,
               running: chatRunning,
+              // 工作区选择器：cwd 落在宿主不认的目录上时，对话区只有一个「选择一个工作区开始」，
+              // 点哪都没输入框。给一个能换的地方，比让人去猜「为什么这里不能打字」强。
+              workspaces: workspaceList,
+              workspaceId: chatWorkspaceId,
+              onPickWorkspace: pickChatWorkspace,
               SessionProvider: props?.SessionProvider,
               renderSlot: props?.renderSlot,
             }))
@@ -5024,6 +5492,26 @@ window.__ModuleLoader__.load({
           })
           : null,
         h("div", { className: "gzs-work" }, head,
+          // 批量出图的进度条：串行出图可能要好几分钟，没有这条就是"点了没反应"
+          batch
+            ? h("div", { className: "gzs-batchbar" },
+              h("span", { className: "gzs-batchbar__k" }, "正在出图"),
+              h("span", { className: "gzs-batchbar__v" },
+                `${batch.done}/${batch.total} · ${batch.current === "cover" ? "封面" : `第 ${sectionIndex(batch.current)} 段`}`),
+              h("span", { className: "gzs-batchbar__bar" },
+                h("i", { style: { width: `${Math.round((batch.done / Math.max(1, batch.total)) * 100)}%` } })),
+              h("div", { className: "gzs-spacer" }),
+              h(Btn, { small: true, kind: "ghost", on: () => { batchRef.current.stop = true; } }, "停在这张之后"))
+            : null,
+          // 对话收起时这条常驻：面板此刻看起来就是「一个只能看、不能说的界面」，
+          // 不写清楚「话要去左栏说」，用户只会得出「按钮都没反应」。
+          !chatOpen
+            ? h("div", { className: "gzs-rolebar" },
+              h("b", null, "左栏是对话，这里是看板"),
+              h("span", null, "改标题、写正文、出图、改排版都在左侧对话里说——这里只显示结果。"),
+              h("div", { className: "gzs-spacer" }),
+              h(Btn, { small: true, kind: "primary", on: toggleChat }, "打开对话"))
+            : null,
           // 三栏放不下时明说一句，并给一键出路（收起对话是最有效的那一步）
           bodyOver
             ? h("div", { className: "gzs-narrow" },
@@ -5034,6 +5522,49 @@ window.__ModuleLoader__.load({
                 : null)
             : null,
           body),
+        // 「步骤」抽屉：两条线的步骤一眼看全，点一下就进来；Esc / 遮罩关掉。
+        stepsOpen
+          ? h("div", { className: "gzs-scrim", onClick: () => setStepsOpen(false) })
+          : null,
+        stepsOpen
+          ? h("aside", { className: "gzs-drawer", "aria-label": "步骤" },
+            h("div", { className: "gzs-drawer__bar" },
+              h("span", { className: "gzs-drawer__t" }, "步骤"),
+              h("span", { className: "gzs-hint" }, "公众号 11 步 / 视频号 8 步 · 面板只报进度"),
+              h("div", { className: "gzs-spacer" }),
+              h(Btn, { small: true, kind: "ghost", on: () => setStepsOpen(false) }, "关闭")),
+            h("div", { className: "gzs-drawer__body" },
+              h(StepsBoard, {
+                view,
+                article,
+                videoConfigured: Boolean(boot.repoConfigured),
+                onJump: () => { setStepsOpen(false); setScreen("article"); },
+                onCreate: () => { setStepsOpen(false); onCreate(); },
+                onGoChat: () => { setStepsOpen(false); chatOpenStore.set(true); },
+                onGoVideo: () => {
+                  setStepsOpen(false);
+                  setChannel("video");
+                  setContext({ kind: "video", id: "", label: "视频号列表" });
+                },
+                // 每行都能"去办"：有落点就跳过去，没落点就起草一句话递进左栏对话。
+                // 只报诊断不给下一步，人还得自己组织语言去问——那正是「看板」和「工作台」的区别。
+                onStep: (row) => {
+                  if (row?.target) {
+                    setStepsOpen(false);
+                    setChannel("article");
+                    setScreen("article");
+                    setSelected(row.target);
+                    return;
+                  }
+                  setStepsOpen(false);
+                  const label = String(article?.title || "这一篇").slice(0, 24);
+                  const text = `【新媒体工作台】${label} · 第 ${String(row.no).padStart(2, "0")} 步「${row.label}」还差：${row.detail || "材料"}。请先只补这一步，别覆盖已有的内容。`;
+                  bringToChat(text).then((result) => say(result.ok
+                    ? "已把这一句带进左栏对话，按回车发出去"
+                    : `没带过去：${result.reason}`));
+                },
+              })))
+          : null,
         // 往期抽屉：借右半边，底下的稿件还在，关掉就回原处。
         // 只读边界沿用 RepoSection 那一套（只 GET，不给保存/删除入口）。
         repoOpen
@@ -5047,37 +5578,6 @@ window.__ModuleLoader__.load({
               h("div", { className: "gzs-spacer" }),
               h(Btn, { small: true, kind: "ghost", on: () => setRepoOpen(false) }, "关闭")),
             h("div", { className: "gzs-drawer__body" }, h(RepoSection, {})))
-          : null,
-        // 推草稿：没有当前文章就不渲染（首页 / 治理视图里没有「推这一篇」这件事）
-        pushOpen && article
-          ? h(PushDialog, {
-            id: article.id,
-            lastPublish: (view?.ledger ?? []).filter((row) => row?.type === "publish" && row.persisted !== false).pop() ?? null,
-            onClose: () => setPushOpen(false),
-            onDone: () => loadState(true).catch(() => {}),
-          })
-          : pushOpen && !article
-            // 首页也能打开它（首启向导第 3 步）：没有当前文章就只做配置，不推。
-            ? h(PushDialog, {
-              id: "",
-              onClose: () => setPushOpen(false),
-              onDone: () => loadState(true).catch(() => {}),
-            })
-            : null,
-        // 发布包：一稿多投。公众号那行能直接跳去推草稿，其余出包复制；保存只写差异（targets）。
-        packOpen && article
-          ? h(PublishPackDialog, {
-            article,
-            onClose: () => setPackOpen(false),
-            onPush: () => { setPackOpen(false); setPushOpen(true); },
-            onSave: (targets) => onSaveArticle({ targets }),
-          })
-          : null,
-        nodeOpen
-          ? h(NodeDialog, {
-            onClose: () => setNodeOpen(false),
-            onSaved: () => loadState(true).catch(() => {}),
-          })
           : null,
         // 「检查」抽屉：QA 分组 + 提案对照 + 去 AI 味 + 清单 + 账本。
         // 它是单篇的附属面，不是一级视图——所以盖在工作台上，关掉就回到原处。
@@ -5110,7 +5610,7 @@ window.__ModuleLoader__.load({
      * 首页：库存 + 文章卡 + 最近动作。
      *
      * 三件事按顺序回答用户打开工作台的第一组问题：
-     * 1. **我手上有多少活** —— 顶部计数条（草稿 / 草稿箱 / 已发布 / 空壳）
+     * 1. **我手上有多少活** —— 顶部计数条（草稿 / 已发布 / 空壳）
      * 2. **我要找哪一篇** —— 状态筛选 + 搜索（标题、小标题、正文都搜；搜索在服务端做）
      * 3. **我刚才干了什么** —— 右栏最近动作
      *
@@ -5121,7 +5621,7 @@ window.__ModuleLoader__.load({
      * 往期（仓库真源，只读）。
      *
      * 为什么要有：工作台自己库里只有「正在改的稿」，而「以前做过什么」全在仓库
-     * `social-media-management/03-scripts` 里。用户原话：「也看不见往期做的内容，
+     * 真源仓库的 `03-scripts` 里。用户原话：「也看不见往期做的内容，
      * 公众号（历史工作台）就可以看见往期的」——历史工作台是按期列表做的，这里对齐。
      *
      * 只读边界：这里**只 GET**，不给任何保存/删除入口。真源归仓库，改稿改工作台那份。
@@ -5175,9 +5675,9 @@ window.__ModuleLoader__.load({
           h("div", { className: "gzs-hint", style: { padding: "10px 0", lineHeight: 1.8 } },
             "还没配置真源仓库：设置环境变量 ",
             h("code", { className: "gzs-mono" }, "GZH_STUDIO_REPO"),
-            "（指向 social-media-management 那一级），或在 settings.json 里填 pipelineRoot。",
+            "（指向你的内容仓库根目录），或在 settings.json 里填 pipelineRoot。",
             h("br"),
-            "往期与视频期都从那里读；没配之前，工作台自己的库照常能用。"));
+            "往期从那读；没配之前，工作台自己的库照常能用。视频期目录是另一回事，去「视频号」页单独指定。"));
       }
 
       return h("div", { className: "gzs-repo" },
@@ -5215,13 +5715,112 @@ window.__ModuleLoader__.load({
         openDir ? h(RepoPreview, { key: openDir, dir: openDir, onClose: () => setOpenDir("") }) : null);
     }
 
+    // ── 往期正文的安全渲染 ────────────────────────────────────────────────────
+    /** 富文本白名单：只放行排版本体用得上的语义标签，其余一律当文本。 */
+    const RICH_TAGS = new Set([
+      "p", "br", "strong", "b", "em", "i", "u", "s", "h2", "h3", "h4",
+      "ul", "ol", "li", "blockquote", "a", "img", "span", "code", "pre", "hr",
+    ]);
+    /** 空元素：没有闭合写法，重建时不要凭空补一个 `</br>`。 */
+    const RICH_VOID = new Set(["br", "hr", "img"]);
+    /** 每个标签允许留下的属性。`style` / `class` / `id` / `on*` 都不在表里，自然全丢。 */
+    const RICH_ATTRS = { a: ["href"], img: ["src", "alt"] };
+    /**
+     * 链接只许这几种开头。`javascript:` / `vbscript:` / `data:` 不以它们开头，于是被丢。
+     *
+     * `\/(?!\/)` 是刻意排掉**协议相对**地址（`//evil.com/x`）：它其实是个外链，
+     * 却长得像站内路径，一眼看不出会跳出站点。图片那边仍然放行（见 `SAFE_IMG`）——
+     * 往期稿里的 CDN 图常写成 `//cdn…`，而图片是纯被动加载，不会导航。
+     */
+    const SAFE_LINK = /^(?:https?:\/\/|\/(?!\/)|#)/i;
+    /** 图片额外允许内联的 `data:image/`（宿主把封面塞进正文时就是这种）与协议相对地址。 */
+    const SAFE_IMG = /^(?:https?:\/\/|\/|#|data:image\/)/i;
+
+    /** 文本转义：`&` 必须先转，否则后面转出来的 `&lt;` 会被自己再转一遍。 */
+    const escapeText = (text) => String(text ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+
+    /** 属性值转义：`&` 先、`"` 后；顺序反了 `&quot;` 会变成 `&amp;quot;`。 */
+    const escapeAttr = (text) => String(text ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/"/g, "&quot;");
+
+    /** 从标签里那段属性原文挑出白名单属性；没赋值的（`disabled`）或值不合法的一律丢。 */
+    function richAttrs(tag, raw) {
+      const allowed = RICH_ATTRS[tag] ?? [];
+      if (!allowed.length || !raw) return "";
+      const out = [];
+      const re = /([a-zA-Z-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g;
+      for (const m of String(raw).matchAll(re)) {
+        const name = m[1].toLowerCase();
+        if (!allowed.includes(name)) continue;
+        const value = m[2] ?? m[3] ?? m[4] ?? "";
+        // 只校验「地址类」属性；`alt` 是纯文本，不该按 URL 判
+        if (name === "href" && !SAFE_LINK.test(value)) continue;
+        if (name === "src" && !SAFE_IMG.test(value)) continue;
+        out.push(`${name}="${escapeAttr(value)}"`);
+      }
+      return out.length ? ` ${out.join(" ")}` : "";
+    }
+
+    /**
+     * 往期正文的安全渲染：**白名单重建**，不是黑名单清洗。
+     *
+     * 以前这里是三条正则（去 `<script>`、去 `on*=`、去 `javascript:`），实测全线漏：
+     * `<img/src=x/onerror=alert(1)>`（属性之间不写空格）、`<a href="&#106;avascript:…">`（实体编码）、
+     * `<iframe src=//evil>`、`<meta http-equiv=refresh>`、`<svg onload=…>` 全都能过。
+     * 黑名单的毛病是「想不全就漏一个」，所以反过来：只放行认识的那二十个标签，
+     * 不认识的整段**转义成看得见的原文**（不是悄悄删掉——用户得知道这里原来写了什么）。
+     *
+     * 三条实现约束：
+     * 1. **不用 DOMParser / innerHTML**：这里要能在没有 DOM 的环境里跑（单测就是），
+     *    而且「先让浏览器解析、再序列化回来」本身就把畸形标签的边界交给浏览器去猜了。
+     * 2. 只用一条**形状合法**的标签正则认标签；认不出的 `<` 一律转成 `&lt;`，
+     *    于是任何漏网的东西都退化成纯文本，不可能变成标记。
+     * 3. 属性值输出前重新转义 `"` 与 `&`：否则一个引号就能从属性里逃出来，
+     *    在标签里另起一个 `on…=`。
+     *
+     * @param {string} input 宿主导出的正文片段（来源是本地仓库，不可信）
+     * @returns {string} 只含白名单标签的 HTML
+     */
+    function sanitizeRichHtml(input) {
+      const text = String(input ?? "");
+      // 每次新建正则：`/g` 带 lastIndex，模块级共用一个实例会被下一次调用从中间开始
+      const shape = /<(\/?)([a-zA-Z][a-zA-Z0-9]*)((?:\s+[a-zA-Z-]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'>]+))?)*)\s*(\/?)>/g;
+      const out = [];
+      let last = 0;
+      let match;
+      while ((match = shape.exec(text)) !== null) {
+        // 两个标签之间的内容一律当文本：这里的 `&`、`<` 都要转义
+        out.push(escapeText(text.slice(last, match.index)));
+        last = shape.lastIndex;
+        const [, closing, rawName, rawAttrs, selfClosing] = match;
+        const name = rawName.toLowerCase();
+        // 不在白名单的标签：整段转义成可见原文。丢掉的话用户会以为这里本来就空着，
+        // 反而看不出稿子里混进了怪东西
+        if (!RICH_TAGS.has(name)) { out.push(escapeText(match[0])); continue; }
+        if (closing) { if (!RICH_VOID.has(name)) out.push(`</${name}>`); continue; }
+        const open = `<${name}${richAttrs(name, rawAttrs)}>`;
+        // `<span/>` 在 HTML 里并不自闭合，原样留着会把后面的内容全吞进这个 span；
+        // 补上闭合，语义等价于「一个空的 span」
+        out.push(selfClosing && !RICH_VOID.has(name) ? `${open}</${name}>` : open);
+      }
+      out.push(escapeText(text.slice(last)));
+      return out.join("");
+    }
+
     /**
      * 往期单篇的只读预览：正文分节 + 排版 HTML。
      *
      * 两条约束都是实的：
-     * - 正文常是 HTML 片段（模板稿就这么落盘），所以要 dangerouslySetInnerHTML，
-     *   进去之前先剥脚本 / 内联事件 / javascript:（不是防外人，是防「往期稿里带了一段能跑的东西」）；
-     * - 排版用 `sandbox=""`（全禁）的 iframe：样式生效、脚本不跑、表单不提交。
+     * - 正文常是 HTML 片段（模板稿就这么落盘），所以要 **同源** `dangerouslySetInnerHTML`：
+     *   进去之前先过 `sanitizeRichHtml` 的白名单重建（不是防外人，是防「往期稿里带了一段能跑的东西」）；
+     * - 排版件**原样**进 `sandbox=""`（全禁）的 iframe：样式生效、脚本不跑、表单不提交。
+     *   这里**故意**不过 sanitizer——`<style>` 不在白名单里，会被整段转义成文本，
+     *   「看排版」就变成看源码了。全禁的 sandbox 已经兜住这一层，不用再剥一次。
      */
     function RepoPreview({ dir, onClose }) {
       const [state, setState] = React.useState({ loading: true, error: "", data: null });
@@ -5240,11 +5839,6 @@ window.__ModuleLoader__.load({
         return () => { live = false; };
       }, [dir]);
 
-      const cleanHtml = (text) => String(text ?? "")
-        .replace(/<script[\s\S]*?<\/script>/gi, "")
-        .replace(/\son[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, "")
-        .replace(/javascript:/gi, "");
-
       const data = state.data;
       const sections = Array.isArray(data?.sections) ? data.sections : [];
       const html = String(data?.html ?? "");
@@ -5255,16 +5849,19 @@ window.__ModuleLoader__.load({
       } else if (state.error) {
         body = h("div", { className: "gzs-hint", style: { padding: 18 } }, `读不到：${state.error}`);
       } else if (mode === "html") {
+        // 原样进 sandbox：这是**唯一**不 sanitize 的一处，理由见上面的注释（`<style>` 要留着）
         body = html
-          ? h("iframe", { className: "gzs-repo__frame", title: "排版预览", sandbox: "", srcDoc: cleanHtml(html) })
+          ? h("iframe", { className: "gzs-repo__frame", title: "排版预览", sandbox: "", srcDoc: html })
           : h("div", { className: "gzs-hint", style: { padding: 18 } }, "这篇没有排版件（site/article.html）");
       } else {
         body = h("div", { className: "gzs-repo__body" },
           sections.length
             ? sections.map((section, index) => h("div", { key: `s-${index}` },
               String(section.heading ?? "").trim() ? h("h4", null, section.heading) : null,
-              String(section.body ?? "").includes("<")
-                ? h("div", { dangerouslySetInnerHTML: { __html: cleanHtml(section.body) } })
+              // 判据要认「<字母」，不能只认「含 `<`」：正文里写 `5 < 10` 会被当成 HTML 送去
+              // 解析，`&lt;` 还被当实体，最后显示成一句被吃掉一半的话
+              /<[a-zA-Z/]/.test(String(section.body ?? ""))
+                ? h("div", { dangerouslySetInnerHTML: { __html: sanitizeRichHtml(section.body) } })
                 : paragraphsOf(section.body).map((text, i) => h("p", { key: i }, text))))
             : h("div", { className: "gzs-hint" }, "这篇没有可读的正文"));
       }
@@ -5311,9 +5908,43 @@ window.__ModuleLoader__.load({
       // 空串 = 「还没选过」：期里有成片就默认落到「成片」，没有才落到口播稿。
       const [openTab, setOpenTab] = React.useState("");
       const [chatHint, setChatHint] = React.useState("");
+      // 「视频目录未配置」这块的两个动作：展开路径输入 / 正在提交 / 结果提示
+      const [pickOpen, setPickOpen] = React.useState(false);
+      const [pickPath, setPickPath] = React.useState("");
+      const [setupBusy, setSetupBusy] = React.useState("");
+      const [setupMsg, setSetupMsg] = React.useState({ kind: "", text: "" });
+
+      /**
+       * 视频目录的两个动作都走宿主：**先校验再落盘**（不存在 / 不是目录 / 没权限当场说清）。
+       * 成功之后重新拉一次，空态自然消失——不需要用户手动刷新。
+       */
+      const runSetup = async (action, pathValue) => {
+        setSetupBusy(action);
+        setSetupMsg({ kind: "", text: "" });
+        try {
+          const result = await postJson(ROUTES.videoSetup, { action, ...(pathValue ? { path: pathValue } : {}) });
+          setSetupMsg({
+            kind: "ok",
+            text: action === "create" ? `已建好：${result.root}` : `已指到：${result.root}`,
+          });
+          setPickOpen(false);
+          setPickPath("");
+          await reload();
+        } catch (error) {
+          setSetupMsg({ kind: "error", text: String(error?.message ?? error) });
+        } finally {
+          setSetupBusy("");
+        }
+      };
 
       const bringVideoPlan = () => {
-        const plan = "【公司视频号】请从 07-video/episode 开始创建下一期视频：先确认选题和期号，再依次产出大纲、口播稿、分镜、配音、分段、字幕、封面和成片。先告诉我建议的期号与第一步。";
+        // 这段话是给**任何**装了这个插件的人用的，不是某家公司的内部流程：
+        // 期目录在哪由用户定（可以是插件建的，也可以是自己指的），所以不写死
+        // `07-video/episode`——让 Agent 不确定就先问。
+        const plan = "【视频号】请帮我做下一期视频：先确认选题和期号，再依次产出大纲、口播稿、分镜、配音、分段、字幕、封面和成片。"
+          + "期是目录：每期一个目录、目录名就是期号，放在视频期目录下面。"
+          + "期目录在哪你不确定就先问我——面板「视频号」页顶上显示的就是当前读的那一个。"
+          + "先告诉我你建议的期号和第一步。";
         bringToChat(plan).then((result) => setChatHint(result.ok
           ? "已带到左侧对话，检查后发送"
           : `没带过去：${result.reason}；可复制这段话到对话`));
@@ -5349,13 +5980,19 @@ window.__ModuleLoader__.load({
       }, [reload]);
 
       const episodes = Array.isArray(feed.data?.episodes) ? feed.data.episodes : [];
+      // **显示宿主真的在扫的那个目录**（`/video` 回的 `root`），不在前端拼约定路径：
+      // 期目录可以配（settings.episodesRoot），前端再拼一遍就等于显示一处、读另一处。
+      const where = shortPath(feed.data?.root ?? "");
+      // 排查类空态（目录不存在 / 读失败）要给人**完整路径**：这时候他正要去改配置，
+      // 只看末两级（`07-video/episode`）没法判断配错在哪一层。
+      const fullPath = String(feed.data?.root ?? "");
 
       const head = h("div", { className: "gzs-vhead" },
         h("div", null,
           h("div", { className: "gzs-vtitle" }, "视频号 · 期"),
           h("div", { className: "gzs-hint", style: { marginTop: 4 } },
             feed.loading ? "读期目录…"
-              : feed.data ? `仓库 07-video/episode · ${episodes.length} 期 · 只读`
+              : feed.data ? `${where || "真源仓库"} · ${episodes.length} 期 · 只读`
                 : feed.status === 404 ? "视频号路由不可用"
                   : "视频期目录读取失败")),
         h("div", { className: "gzs-spacer" }),
@@ -5375,35 +6012,111 @@ window.__ModuleLoader__.load({
                 routeMissing
                   ? h("p", { className: "gzs-hint" },
                     "如果插件刚更新过，需要重启 dsh web 让宿主重新挂路由；重启后仍失败，再查插件加载日志。")
-                  : h("p", { className: "gzs-hint" }, "公司视频号真源：07-video/episode；面板不会修改真源目录。"),
+                  : h("p", { className: "gzs-hint" }, `视频期读的是 ${where || "真源仓库里的期目录"}；面板不会改动那个目录。`),
                 h("div", { className: "gzs-vempty__actions" },
                   h(Btn, { small: true, on: bringVideoPlan }, "带到对话"),
                   h(Btn, { small: true, kind: "ghost", on: reload }, "重试")))),
             h(VideoAside, { episodes: [], open: false, onPlan: bringVideoPlan, hint: chatHint })));
       }
 
-      if (!feed.loading && feed.data?.configured === false) {
+      if (!feed.loading && feed.data && feed.data.exists === false) {
+        /**
+         * 仓库配了、但期目录不存在。该做的事和「目录是空的」完全不同：
+         * 这里是**指个地方**，那里是**开工做第一期**。
+         *
+         * 文案口径（2026-11-09 作者定）：屏幕上不出现 `settings.json` / `GZH_STUDIO_EPISODES` /
+         * `episodesRoot` 这些实现词，也不出现「不是坏了，是还没建」这种辩解句——
+         * 用户只想知道两件事：**现在是什么状态**、**点哪儿能好**。
+         * 所以只留两条路，各给一颗按钮：
+         *   有素材 → 指出放各期的那一层目录；没素材 → 在仓库里建出约定目录。
+         */
+        const creating = setupBusy === "create";
+        const picking = setupBusy === "path";
         return h("div", { className: "gzs-vboard" }, head,
-          h("div", { className: "gzs-vsplit" },
-            h("div", { className: "gzs-vlist" },
-              h("div", { className: "gzs-vempty gzs-vempty--start" },
-                h("b", null, "还没配置真源仓库"),
-                h("p", null, "视频期从真源仓库的 07-video/episode 读。设一个环境变量就能看见："),
-                h("p", { className: "gzs-hint gzs-mono" }, "GZH_STUDIO_REPO=<social-media-management 那一级>"),
-                h("p", { className: "gzs-hint" }, "不想用环境变量，就在 settings.json 里写 pipelineRoot。没配之前公众号那条线照常能用。"),
+          h("div", { className: "gzs-vempty gzs-vempty--start", style: { marginTop: 14, maxWidth: 760 } },
+            h("b", null, "视频目录未配置"),
+            h("p", null, "尚未指定视频期文件的存放位置，因此暂时读不到各期内容。"),
+            h("p", { className: "gzs-vhint-strong" }, "先选一个目录，就能开始读期了："),
+            h("ol", { className: "gzs-setup" },
+              h("li", null,
+                h("div", { className: "gzs-setup__t" }, "已经有素材"),
+                h("div", { className: "gzs-setup__d" },
+                  "指定**放各期的那一层目录**（里面每个子文件夹就是一期，文件夹名就是期号）。"),
                 h("div", { className: "gzs-vempty__actions" },
-                  h(Btn, { small: true, kind: "ghost", on: reload }, "重新读取")))),
-            h(VideoAside, { episodes: [], open: false, onPlan: bringVideoPlan, hint: chatHint })));
+                  h(Btn, {
+                    small: true, kind: "primary",
+                    disabled: Boolean(setupBusy),
+                    on: () => { setPickOpen((open) => !open); setSetupMsg({ kind: "", text: "" }); },
+                  }, pickOpen ? "先不选" : "选择视频目录"),
+                  h(Btn, {
+                    small: true, kind: "ghost",
+                    disabled: Boolean(setupBusy),
+                    on: () => reload(),
+                  }, "重新读取")),
+                pickOpen
+                  ? h("div", { className: "gzs-setup__pick" },
+                    h("input", {
+                      className: "gzs-input gzs-mono",
+                      placeholder: "粘贴文件夹的完整路径",
+                      value: pickPath,
+                      autoFocus: true,
+                      onChange: (event) => setPickPath(event.target.value),
+                      onKeyDown: (event) => { if (event.key === "Enter" && pickPath.trim()) runSetup("path", pickPath.trim()); },
+                    }),
+                    h("div", { className: "gzs-hint" },
+                      "浏览器拿不到文件夹的真实路径，所以要粘贴：在资源管理器里选中文件夹 → Shift + 右键 → 「复制文件地址」，粘到这里（也可以直接打字）。"),
+                    h("div", { className: "gzs-vempty__actions" },
+                      h(Btn, {
+                        small: true, kind: "primary",
+                        disabled: picking || !pickPath.trim(),
+                        on: () => runSetup("path", pickPath.trim()),
+                      }, picking ? "正在确认…" : "用这个目录")))
+                  : null),
+              h("li", null,
+                h("div", { className: "gzs-setup__t" }, "还没有素材"),
+                h("div", { className: "gzs-setup__d" }, "暂无视频内容。建议先建好目录，再让 Agent 做第一期。"),
+                h("div", { className: "gzs-vempty__actions" },
+                  h(Btn, {
+                    small: true, kind: "primary",
+                    disabled: Boolean(setupBusy),
+                    on: () => runSetup("create"),
+                  }, creating ? "正在创建…" : "创建默认目录")),
+                // 默认目录归**插件自己**（`<数据目录>/episodes`），不往用户的内容仓库里塞
+                // `07-video` 这种编号目录——那是某套仓库的习惯，不是用户的。
+                // 正文只说「插件自己的数据目录」，绝对路径放 title，需要核对的人悬停可见。
+                h("div", {
+                  className: "gzs-hint",
+                  title: feed.data?.defaultDir ? `实际路径：${feed.data.defaultDir}` : "建在插件自己的数据目录下",
+                }, "会建在插件自己的数据目录里，不动你的内容仓库（鼠标停在这里看完整路径）"))),
+            setupMsg.text
+              ? h("div", { className: `gzs-setup__msg gzs-setup__msg--${setupMsg.kind}` }, setupMsg.text)
+              : null,
+            // 八步照样摆出来：用户此刻最想知道的是「建好之后能看见什么」
+            h("div", { className: "gzs-vempty__steps" },
+              VIDEO_STEPS.map((step, index) => h("span", { key: step.key }, `${index + 1}. ${step.label}`))),
+            h("div", { className: "gzs-vempty__actions" },
+              h(Btn, { small: true, kind: "ghost", on: bringVideoPlan }, "带到对话，让它做第一期")),
+            chatHint ? h("span", { className: "gzs-hint" }, chatHint) : null));
       }
 
+      // 「没配仓库」那一屏已经并进上面的「视频目录未配置」：因为「创建默认目录」现在
+      // 建在插件自己的数据目录里、**不需要任何仓库**，再单独给一屏讲环境变量只会让人多跳一次。
+
       if (!feed.loading && !episodes.length) {
+        /**
+         * 走到这里 = **有目录可读、但一期都还没有**（宿主回 `exists === true` 且 `episodes` 为空）。
+         *
+         * 作者 2026-11-09 明确要求：「期目录 07-video/episode 已经在盘上，只是里面还没有期」
+         * 这句**不要写**。理由站得住：读的是哪个目录，页头已经写着（`07-video/episode · 0 期`），
+         * 正文再复述一遍既啰嗦，又把「某个内部路径」抬到了正文里。
+         * 所以正文只留一句「还没有期」+ 下一步该做什么。
+         */
         return h("div", { className: "gzs-vboard" }, head,
           h("div", { className: "gzs-vsplit" },
             h("div", { className: "gzs-vlist" },
               h("div", { className: "gzs-vempty gzs-vempty--start" },
-                h("b", null, "暂无视频期"),
-                h("p", null, "这不是错误：公司视频号的 07-video/episode 目前还没有一期可展示。"),
-                h("p", null, "可以先在左侧对话里确定选题和期号，看板会随后显示八步进度。"),
+                h("b", null, "还没有期"),
+                h("p", null, "在左侧对话里定下选题和期号，让它按八步往前做；每期一个目录、目录名就是期号，建好后这里会显示进度。"),
                 h("div", { className: "gzs-vempty__actions" },
                   h(Btn, { small: true, kind: "primary", on: bringVideoPlan }, "带到对话，开始创建视频")),
                 chatHint ? h("span", { className: "gzs-hint" }, chatHint) : null)),
@@ -5418,7 +6131,7 @@ window.__ModuleLoader__.load({
             feed.loading && !feed.data
               ? h("div", { className: "gzs-vempty" },
                 h("b", null, "读期目录…"),
-                h("p", null, "正在看 07-video/episode 里有哪些期。"))
+                h("p", null, `正在读 ${where || "期目录"} 里有哪些期。`))
               : null,
             // 列表本身也标一句「缺几件」：扫一眼就知道哪期最接近能发
             episodes.map((ep) => {
@@ -5479,18 +6192,18 @@ window.__ModuleLoader__.load({
 
       return h("div", { className: "gzs-vaside" },
         h("div", { className: "gzs-vaside__card" },
-          h("div", { className: "gzs-vaside__k" }, open ? "这一期已打开" : "还没选期"),
+          h("div", { className: "gzs-vaside__k" }, open ? "这一期已打开" : "还没选哪一期"),
           h("div", { className: "gzs-vaside__v" },
-            open ? "左侧高亮的那一期，正文在右边往下看" : "在左边点一期，这里会换成它的口播稿 / 分镜 / 分段 / 字幕"),
+            open ? "左侧高亮的那一期，正文在右边往下看" : "在左边点一期，这里会显示它的解说文字、分镜、分段和字幕"),
           total
             ? h("div", { className: "gzs-vaside__stats" },
               h("span", null, h("b", null, String(total)), " 期"),
               h("span", null, h("b", null, String(complete)), " 期八件齐"),
               h("span", null, h("b", null, String(total - complete)), " 期在途"))
-            : h("div", { className: "gzs-vaside__stats" }, h("span", null, "盘上还没有期目录"))),
+            : h("div", { className: "gzs-vaside__stats" }, h("span", null, "仓库里还没有视频期"))),
 
         h("div", { className: "gzs-vaside__card" },
-          h("div", { className: "gzs-vaside__k" }, "八步缺口"),
+          h("div", { className: "gzs-vaside__k" }, "还差几步"),
           total
             ? (openGaps.length
               ? h("div", { className: "gzs-vgap" }, openGaps.map((gap) => {
@@ -5501,13 +6214,15 @@ window.__ModuleLoader__.load({
                     h("i", { style: { width: `${Math.round((filled / total) * 100)}%` } })),
                   h("span", { className: "gzs-vgap__n" }, `${filled}/${total}`));
               }))
-              : h("div", { className: "gzs-vaside__ok" }, "八件都齐了，可以去对话里确认成片与发布。"))
-            : h("div", { className: "gzs-hint" }, "有了第一期之后，这里会按步骤统计缺口。")),
+              : h("div", { className: "gzs-vaside__ok" }, "这一步该有的文件都齐了，可以去对话里确认成片与发布。"))
+            : h("div", { className: "gzs-hint" }, "有了第一期之后，这里会按步骤显示还差哪些。")),
 
         h("div", { className: "gzs-vaside__card" },
           h("div", { className: "gzs-vaside__k" }, "生成在哪做"),
+          // 作者 2026-11-09 要求删掉「看板只读盘：它显示 <路径> 里有什么，不替你生成」：
+          // 这句既复述了页头已经写着的路径，又在对用户解释实现——他要的是「生成去哪做」。
           h("p", { className: "gzs-vaside__p" },
-            "看板只读盘：它显示 07-video/episode 里有什么，不替你生成。大纲、口播稿、分镜、配音、分段、字幕、封面、成片都由会话里的 agent 产出，写完刷新就能看见。"),
+            "大纲、口播稿、分镜、配音、分段、字幕、封面、成片都由会话里的 agent 产出，写完刷新就能看见。"),
           h("div", { className: "gzs-vaside__acts" },
             h(Btn, { small: true, kind: "primary", on: onPlan }, "带到对话"),
             hint ? h("span", { className: "gzs-hint" }, hint) : null)));
@@ -5615,7 +6330,7 @@ window.__ModuleLoader__.load({
               }))))
           : null,
         h("div", { className: "gzs-vpack" },
-          h("div", { className: "gzs-eyebrow" }, "发布包"),
+          h("div", { className: "gzs-eyebrow" }, "发布文案"),
           h("p", { className: "gzs-hint" }, "视频号没有开放上传接口：这块只负责把文案和产物拿得走，上传仍然在视频号助手里做。"),
           h("label", { className: "gzs-push__field" },
             h("span", { className: "gzs-push__k" }, "标题"),
@@ -5645,26 +6360,30 @@ window.__ModuleLoader__.load({
      * 首页「现在可以做这些」：首屏先回答「该干什么」，再回答「我有什么」。
      *
      * 只用 `/state` 已经下发过的字段（不做额外请求、不跑 QA）：
-     * 草稿箱待发、配图没齐、空壳、最近在改。每一条都**直接跳到那篇**，
+     * 配图没齐、空壳、最近在改。每一条都**直接跳到那篇**，
      * 不让人先切筛选再自己找。
      */
     function TodayQueue({ list, counts, activity, onOpen, onFilter, onCreate }) {
       const cards = Array.isArray(list) ? list : [];
       const stat = counts ?? {};
-      const toSend = Number(stat.byState?.draftbox ?? 0);
       const empty = Number(stat.empty ?? 0);
+      const empties = cards.filter((item) => item.empty);
+      /**
+       * 「配图没齐」要**排除正文还空着的**。
+       *
+       * 建稿时会先摆 N 个空段落，这时「段落数 > 配图数」永远成立，于是每一篇新稿
+       * 都同时出现在「配图没齐」和「空壳」两格里——冒烟截图里就是「3 配图没齐 / 3 空壳」，
+       * 而这三篇一个字都还没写。先有字才谈得上配图：空壳只进「空壳」那一格。
+       */
       const lacking = cards.filter((item) => {
+        if (item.empty) return false;
         const sections = Number(item.sections ?? 0);
         if (!sections) return false;
         const bodyImages = Number(item.images ?? 0) - (item.cover ? 1 : 0);
         return bodyImages < sections;
       });
-      const empties = cards.filter((item) => item.empty);
       const recent = (Array.isArray(activity) ? activity : []).find((row) => row && row.id && row.event);
       const items = [
-        toSend
-          ? { key: "send", n: toSend, title: "在草稿箱等发布", hint: "去后台点发布，或回来再看一眼", on: () => onFilter?.({ state: "draftbox" }) }
-          : null,
         lacking.length
           ? { key: "img", n: lacking.length, title: "配图没齐", hint: `先补《${String(lacking[0].title || lacking[0].id).slice(0, 12)}》`, on: () => onOpen?.(lacking[0].id) }
           : null,
@@ -5696,99 +6415,171 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 首启向导：空库时先回答「三步怎么开始」，而不是「库存 0 篇」。
+     * 内置示例稿：**用实物代替说明书**。
      *
-     * 不做多步弹窗：用户还没看到界面就被弹窗挡住，第一感觉是「这东西很麻烦」。
-     * 三条都列出来，第 2、3 步明确写「可跳过」——默认占位图和导出 HTML 都能把流程走完。
+     * 空库时讲一段「本工作台支持……」几乎没人看；让人点开一篇成品、看见排版、
+     * 看见「必改 1 条 / 提案待确认 1 份 / 账本 5 条」，五秒就懂这东西产出的是什么。
+     *
+     * 硬约束：**不落库、不发任何写请求**。它就是一份静态数据，渲染时走和真稿
+     * 同一套手机预览组件——所以看到的样子和真稿一致，不是另做一套假界面。
+     * 这里刻意不带图：预览里的图片地址是按 id 拼接口路径的，示例 id 取不到图，
+     * 画出来就是一片「图缺失」，比不带图更难看。
      */
-    function FirstRun({ onCreate, onConfigureNodes, onConfigureWechat }) {
-      const steps = [
-        { no: "1", title: "新建一篇", desc: "内容类型是可选的：不选也能写、能出图、能推；选了只是多一套禁用词与默认长相。", action: "新建第一篇", on: onCreate, main: true },
-        { no: "2", title: "配出图节点（可跳过）", desc: "默认用占位图（不联网、出 SVG），足够把流程点一遍；要真图就填一个 OpenAI 兼容节点，key 只写环境变量名。", action: "配置节点", on: onConfigureNodes },
-        { no: "3", title: "连公众号（可选）", desc: "填 AppID / AppSecret 后能直接推到草稿箱；不连也能导出 HTML 手工粘。", action: "配置公众号", on: onConfigureWechat },
-      ];
-      return h("div", { className: "gzs-firstrun" },
-        h("div", { className: "gzs-firstrun__h" }, "三步开始"),
-        h("div", { className: "gzs-firstrun__steps" },
-          steps.map((step) => h("div", { key: step.no, className: "gzs-firstrun__step" },
-            h("span", { className: "gzs-firstrun__no" }, step.no),
-            h("div", { className: "gzs-firstrun__body" },
-              h("div", { className: "gzs-firstrun__t" }, step.title),
-              h("div", { className: "gzs-firstrun__d" }, step.desc)),
-            h(Btn, { small: true, kind: step.main ? "primary" : "ghost", on: step.on }, step.action)))));
+    const EXAMPLE_VIEW = {
+      article: {
+        id: "example",
+        title: "一家药企把审批从 14 天压到 3 天，靠的不是换系统",
+        subtitle: "三个动作，其中一个只用了一周",
+        template: "business",
+        track: "medical",
+        updatedAt: Date.now() - 1000 * 60 * 42,
+        cover: { slot: "cover", current: "", versions: [] },
+        sections: [
+          { id: "s1", heading: "先说结论", body: "把审批从 14 天压到 3 天，靠的不是换掉 OA，而是把「谁在等谁」画了出来，然后砍掉了两处互相等人的环节。", image: { slot: "sec-s1", current: "", versions: [] } },
+          { id: "s2", heading: "卡在哪：三个部门互相等", body: "流程里真正耗时的不是审批动作本身，而是「我的下一手在等人回消息」。\n\n画完线才发现：中间有 9 天是在等一个其实不需要他拍板的人点同意。", image: { slot: "sec-s2", current: "", versions: [] } },
+          { id: "s3", heading: "动作一：把串行改成并行", body: "合规与财务本来可以同时看，之前却是排队的。改成并行之后，这两步加起来从 6 天变成 2 天。", image: { slot: "sec-s3", current: "", versions: [] } },
+          { id: "s4", heading: "动作二：给「等待」设到期提醒", body: "不是催人，而是让「这件事卡在谁那儿、卡了几天」对所有人可见。这一条只花了一周就上线。", image: { slot: "sec-s4", current: "", versions: [] } },
+          { id: "s5", heading: "动作三：删掉一次重复填报", body: "同一份物料信息在两个系统里各填一次，删掉之后单笔平均省 40 分钟。", image: { slot: "sec-s5", current: "", versions: [] } },
+          { id: "s6", heading: "别急着上系统", body: "先画流程再谈工具。换系统往往把旧流程原样搬过去，等待还在，只是换了个界面等。", image: { slot: "sec-s6", current: "", versions: [] } },
+        ],
+      },
+      qa: {
+        ok: false,
+        counts: { error: 1, warn: 1, info: 0 },
+        items: [
+          { level: "error", scope: "sec-s3", message: "「据行业报告」没有写来源：医疗类稿件里的数据要能追溯到原文", fix: "补一句出处，或删掉这个数字" },
+          { level: "warn", scope: "article", message: "标题 25 字，公众号上限 32 字；转发到群里会显示不全", fix: "把「靠的不是换系统」挪到副标题" },
+        ],
+      },
+      proposals: [
+        { pid: "p-example01", status: "waiting-user", summary: "压短开头、补一处来源", changes: [{ target: "第 1 段" }, { target: "第 3 段" }] },
+      ],
+      ledger: [
+        { type: "create", at: Date.now() - 1000 * 60 * 95, note: "新建文章，6 段" },
+        { type: "script", at: Date.now() - 1000 * 60 * 80, note: "整篇落稿" },
+        { type: "generate", at: Date.now() - 1000 * 60 * 55, note: "封面 v001（900×383）" },
+        { type: "propose", at: Date.now() - 1000 * 60 * 30, note: "提案：压短开头、补一处来源" },
+        { type: "export", at: Date.now() - 1000 * 60 * 12, note: "导出 HTML" },
+      ],
+    };
+
+    /**
+     * 示例稿整屏（只读）。看完给一条出口：开始我自己的第一篇。
+     * @param {{templates?: Array, onClose: Function, onStart?: Function}} props
+     */
+    function ExampleSheet({ templates, onClose, onStart }) {
+      const { article, qa, proposals, ledger } = EXAMPLE_VIEW;
+      const LEVEL = { error: "必改", warn: "提醒", info: "提示" };
+      return h("div", { className: "gzs-example" },
+        h("div", { className: "gzs-example__head" },
+          h("span", { className: "gzs-example__badge" }, "示例 · 只读"),
+          h("span", { className: "gzs-hint" }, "内置的一篇成品，用来看清「一篇稿在面板里是什么样」。不进你的库，也不能改。"),
+          h("span", { className: "gzs-grow" }),
+          h(Btn, { small: true, kind: "ghost", on: onClose }, "返回"),
+          h(Btn, { small: true, kind: "primary", on: onStart ?? onClose }, "开始我自己的第一篇")),
+        h("div", { className: "gzs-example__body" },
+          h("div", { className: "gzs-example__phone" },
+            h(PhonePreview, { article, templates, selected: "sec-s1", onSelect: () => {}, busy: false })),
+          h("div", { className: "gzs-example__side" },
+            h("div", { className: "gzs-example__block" },
+              h("div", { className: "gzs-example__k" }, `检查结果（必改 ${qa.counts.error} · 提醒 ${qa.counts.warn}）`),
+              qa.items.map((item, index) => h("div", { key: index, className: "gzs-example__row" },
+                h(Badge, { level: item.level }, LEVEL[item.level] ?? item.level),
+                h("span", null, item.message)))),
+            h("div", { className: "gzs-example__block" },
+              h("div", { className: "gzs-example__k" }, `改稿提案（待确认 ${proposals.length} 份）`),
+              proposals.map((item) => h("div", { key: item.pid, className: "gzs-example__row" },
+                h(Badge, { level: "info" }, "待确认"),
+                h("span", null, `${item.summary}（${item.changes.map((c) => c.target).join(" / ")}）`))),
+              h("div", { className: "gzs-hint" }, "提案是「先看对照再确认」，点了同意才写进正文——这是 Agent 改稿和人工改稿的分界线。")),
+            h("div", { className: "gzs-example__block" },
+              h("div", { className: "gzs-example__k" }, `最近动作（账本 ${ledger.length} 条）`),
+              ledger.map((item, index) => h("div", { key: index, className: "gzs-example__row" },
+                h("span", { className: "gzs-example__t" }, timeText(item.at)),
+                h("span", null, item.note)))))));
     }
 
     /**
-     * 出图节点配置。**key 只写环境变量名**（和读取侧同一个口径）：
-     * 界面上永远不出现密钥本身，避免「填一次就落到 json 里」。
+     * 首屏（空库）。
+     *
+     * 口径：**不教配置，只给一句话和一个入口。**
+     *
+     * 上一版是「三步开始：新建一篇 / 配出图节点 / 连公众号」，三件事摆在同一个高度上。
+     * 对一个刚装插件的人，他此刻只想验证「这东西能不能帮我写稿」；看见 AppID、
+     * AppSecret、apiKeyEnv 只会让他先退出去。接管道是**用起来之后**才需要的事。
+     *
+     * 三个动作按重要性排：
+     * 1. 一句话 → 填进原生对话（只填不发）：对话是唯一输入口，面板不自己再造一个编辑器；
+     * 2. 示例 chips：给不知从何下手的人一个能改的起点；
+     * 3. 「看看成品」：用实物代替说明书——一篇只读示例稿比三段文字有效得多。
      */
-    function NodeDialog({ onClose, onSaved }) {
-      const [form, setForm] = React.useState({
-        name: "我的出图节点",
-        baseURL: "https://api.openai.com",
-        apiKeyEnv: "OPENAI_API_KEY",
-        model: "gpt-image-1",
-        size: "",
-      });
-      const [busy, setBusy] = React.useState(false);
-      const [error, setError] = React.useState("");
-      const patch = (next) => setForm((prev) => ({ ...prev, ...next }));
-      // Esc 关掉：弹窗开着时人是「被打断」的状态，键盘要能退出去。
-      React.useEffect(() => {
-        const onKey = (event) => { if (event?.key === "Escape" && !busy) onClose?.(); };
-        window.addEventListener?.("keydown", onKey);
-        return () => window.removeEventListener?.("keydown", onKey);
-      }, [busy]);
-      const idOf = () => String(form.name ?? "").toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, 32) || "custom";
-
-      const save = async () => {
-        setBusy(true);
-        setError("");
-        try {
-          const id = idOf();
-          await postJson(ROUTES.node, {
-            node: { id, name: form.name, baseURL: form.baseURL, apiKeyEnv: form.apiKeyEnv, model: form.model, size: form.size, fake: false },
-            defaultNode: id,
-          });
-          onSaved?.();
-          onClose?.();
-        } catch (failure) {
-          setError(failure.message);
-        } finally {
-          setBusy(false);
-        }
+    function Welcome({ onCreate, onOpenExample, chatOpen = true, chatReady = true, onOpenChat, onGoVideo }) {
+      const SEED = "帮我写一篇关于 ______ 的公众号稿，讲给 ______ 看。";
+      const [seed, setSeed] = React.useState(SEED);
+      const [hint, setHint] = React.useState("");
+      /**
+       * 点了「开始写」到字真的落进左栏输入框之间，有一段空窗（左栏刚展开、会话还在开会）。
+       * 以前这段空窗里按钮毫无变化，用户的原话就是「点开始写根本没有反应」。
+       * 所以先立刻回一句「正在往左栏填」，再等结果；失败时把原因和下一步一起给人话。
+       */
+      const [pending, setPending] = React.useState(false);
+      const chips = [
+        "把这段素材整理成一篇公众号稿",
+        "帮我改这篇稿的开头，更具体一点",
+        "给这篇稿出一张封面图",
+      ];
+      const send = (text) => {
+        if (pending) return;
+        setPending(true);
+        setHint(chatOpen ? "正在把这句话填进左栏对话…" : "左栏对话收起了，先展开再填…");
+        bringToChat(text).then((result) => {
+          setPending(false);
+          setHint(result.ok
+            ? "已填进左栏对话——补完那两句，按回车发送（面板不替你按回车）。"
+            : `没填进去：${result.reason}。可以直接在左栏对话里说，或点「让 AI 先给 3 个方向」。`);
+        });
       };
-
-      const field = (label, key, extra = {}) => h("label", { className: "gzs-push__field" },
-        h("span", { className: "gzs-push__k" }, label),
-        h("input", {
-          className: "gzs-input", value: form[key],
-          onChange: (event) => patch({ [key]: event.target.value }),
-          ...extra,
-        }));
-
-      return h("div", { className: "gzs-modal", onClick: (event) => { if (event.target === event.currentTarget && !busy) onClose?.(); } },
-        h("div", { className: "gzs-modal__card", role: "dialog", "aria-label": "配置出图节点" },
-          h("div", { className: "gzs-modal__bar" },
-            h("span", { className: "gzs-modal__t" }, "配置出图节点"),
-            h("div", { className: "gzs-spacer" }),
-            h("button", { className: "gzs-chatcol__x", onClick: () => { if (!busy) onClose?.(); }, title: "关闭" }, "×")),
-          h("div", { className: "gzs-modal__body" },
-            h("p", { className: "gzs-push__lead" },
-              "只支持 OpenAI 兼容接口：",
-              h("code", null, "POST {baseURL}/v1/images/generations"),
-              "。密钥不填在这里——填「环境变量名」，插件只从环境变量读，不落盘。"),
-            field("节点名", "name", { placeholder: "例：我的出图节点" }),
-            field("接口地址", "baseURL", { placeholder: "https://api.openai.com", spellCheck: false }),
-            field("密钥的环境变量名", "apiKeyEnv", { placeholder: "OPENAI_API_KEY", spellCheck: false }),
-            field("模型", "model", { placeholder: "gpt-image-1", spellCheck: false }),
-            field("固定尺寸（可空）", "size", { placeholder: "1024x1024；留空按槽位推荐" }),
-            error ? h("div", { className: "gzs-push__prob" }, error) : null,
-            h("p", { className: "gzs-hint" },
-              "尺寸必须是 64 的倍数：不是倍数时网关不报错、直接给一张方图。插件发请求前会自动吸附到最接近的比例档。")),
-          h("div", { className: "gzs-modal__foot" },
-            h(Btn, { small: true, kind: "ghost", on: onClose, disabled: busy }, "取消"),
-            h(Btn, { kind: "primary", on: save, disabled: busy || !form.baseURL.trim() || !form.apiKeyEnv.trim() }, busy ? "保存中…" : "保存并设为默认"))));
+      return h("div", { className: "gzs-welcome" },
+        h("div", { className: "gzs-welcome__lead" }, "说一句话，它帮你从选题写到成稿"),
+        h("div", { className: "gzs-welcome__sub" },
+          "对话在左栏，结果落在这里：改标题、写正文、出配图和封面都在左栏说；这一页是看板——你有哪些稿、这篇卡在哪、下一步点什么。"),
+        // 三条分工写死在这儿：不问「为什么右边不能打字」，因为「哪边做什么」本来就该先说清。
+        h("div", { className: "gzs-welcome__flow" },
+          h("span", null, h("b", null, "① 左栏说"), "一句大白话"),
+          h("span", null, h("b", null, "② 右栏看"), "稿子和图自己长出来"),
+          h("span", null, h("b", null, "③ 接着说"), "改哪一段都行")),
+        !chatReady
+          ? h("div", { className: "gzs-welcome__alert", role: "alert" },
+            h("b", null, "左栏对话还没接上"),
+            h("span", null, "它要先绑一个工作区才有输入框。点开左栏顶部的工作区下拉选一个，再回来点「开始写」。"))
+          : null,
+        h("div", { className: "gzs-welcome__seed" },
+          h("textarea", {
+            className: "gzs-area", rows: 2, value: seed, "aria-label": "第一句话",
+            onChange: (event) => setSeed(event.target.value),
+          }),
+          h(Btn, { kind: "primary", disabled: pending, on: () => send(seed) }, pending ? "正在填…" : "开始写")),
+        h("div", { className: "gzs-hint", style: { marginTop: 5 } },
+          "把两条横线换成你的选题和读者。面板只把这句话「填进」左栏对话，按回车才发出去。"),
+        h("div", { className: "gzs-welcome__chips" },
+          chips.map((text) => h(Btn, { key: text, small: true, kind: "ghost", disabled: pending, on: () => send(text) }, text))),
+        h("div", { className: "gzs-welcome__alt" },
+          // 没有「从零自己填」了：标题、讲给谁、文案都是 AI 先给、人来选。
+          // 点这颗 = 建一张空白稿 + 请它给三个方向（见 Workspace.onCreate）。
+          h(Btn, { small: true, kind: "ghost", on: onCreate }, "让 AI 先给 3 个方向"),
+          !chatOpen && typeof onOpenChat === "function"
+            ? h(Btn, { small: true, kind: "ghost", on: onOpenChat }, "展开左栏对话")
+            : null,
+          h(Btn, { small: true, kind: "ghost", on: onOpenExample }, "看看一篇成品长什么样")),
+        hint ? h("div", { className: "gzs-hint", style: { marginTop: 8 } }, hint) : null,
+        h("div", { className: "gzs-welcome__more" },
+          h("div", { className: "gzs-welcome__rows" },
+            h("span", { className: "gzs-hint" },
+              "出图会用这台机器已配置好的模型（id 里带 image 的，例如 gpt-image-2）；要换模型，在 DSH 的模型设置里改，不在这里配。"),
+            // 首屏只讲公众号，是「我的视频面板呢」的另一半来源：功能在，但这一页一个字没提。
+            typeof onGoVideo === "function"
+              ? h(Btn, { small: true, kind: "ghost", on: onGoVideo }, "也能做视频号：八步从大纲到成片 →")
+              : null)));
     }
 
     function VideoEpisode({ id, onClose, refreshKey = 0, tab: tabProp, onTab } = {}) {
@@ -5799,7 +6590,7 @@ window.__ModuleLoader__.load({
       const [chatHint, setChatHint] = React.useState("");
 
       const bringEpisodePlan = () => {
-        const plan = `【公司视频号 · ${id}】请继续创建这一期视频。先检查并补齐缺失的八步：大纲、口播稿、分镜、配音、分段、字幕、封面、成片；先告诉我当前缺口和下一步，不要直接覆盖已有文件。`;
+        const plan = `【视频号 · ${id}】请继续做这一期视频。先检查并补齐缺的八步：大纲、口播稿、分镜、配音、分段、字幕、封面、成片；先告诉我当前缺口和下一步，不要直接覆盖已有文件。`;
         bringToChat(plan).then((result) => setChatHint(result.ok
           ? "已带到左侧对话，检查后发送"
           : `没带过去：${result.reason}；可复制这段话到对话`));
@@ -5926,7 +6717,8 @@ window.__ModuleLoader__.load({
       return blocks;
     }
 
-    function Home({ list, root, onOpen, onCreate, activity, counts, filters, matched, onFilter, busy, tracks, onConfigureNodes, onConfigureWechat }) {
+    function Home({ list, root, onOpen, onCreate, activity, counts, filters, matched, onFilter, busy, tracks, templates, onOpenExample,
+      chatOpen = true, chatReady = true, onOpenChat, onGoVideo }) {
       const cards = Array.isArray(list) ? list : [];
       const acts = Array.isArray(activity) ? activity : [];
       // 卡片上的赛道名：只显示名字，不带规则细节（详情在 Inspector 与 QA 里）
@@ -6005,7 +6797,6 @@ window.__ModuleLoader__.load({
           h("div", { className: "gzs-stock__nums" },
             stateChip("all", "全部", stat.total),
             stateChip("draft", "草稿", stat.byState?.draft ?? 0),
-            stateChip("draftbox", "草稿箱", stat.byState?.draftbox ?? 0),
             stateChip("published", "已发布", stat.byState?.published ?? 0),
             h("span", { className: "gzs-stat gzs-stat--plain", title: "建了但正文还是空的" },
               h("span", { className: "gzs-stat__n" }, String(stat.empty ?? 0)),
@@ -6087,7 +6878,7 @@ window.__ModuleLoader__.load({
       else if (cur.track) filterWords.push(`内容类型「${(Array.isArray(tracks) ? tracks : []).find((track) => track.id === cur.track)?.name ?? cur.track}」`);
       if (cur.month) filterWords.push(`${cur.month.slice(5)} 月`);
       if (cur.state && cur.state !== "all") {
-        filterWords.push({ draft: "草稿", draftbox: "草稿箱", published: "已发布" }[cur.state] ?? cur.state);
+        filterWords.push({ draft: "草稿", published: "已发布" }[cur.state] ?? cur.state);
       }
       const headHint = filterWords.length
         ? `筛出 ${matched ?? cards.length} 篇 · ${filterWords.join(" + ")}`
@@ -6143,12 +6934,12 @@ window.__ModuleLoader__.load({
                     a.subtitle ? h("div", { className: "gzs-card__sub" }, a.subtitle) : null,
                     h("div", { className: "gzs-card__meta" },
                       // 生命周期放在最前：它回答「这篇在作者手里到哪了」，
-                      // 比段数图数更该被先看到。人标的加「手」字标记，区分自动推断。
+                      // 比段数图数更该被先看到。人标的加「手」字标记，和默认值区分开。
                       a.lifecycle?.value
                         ? h("span", {
                           className: `gzs-card__life gzs-card__life--${a.lifecycle.value}`,
-                          title: a.lifecycle.source === "manual" ? "你自己标的" : "按账本自动推断",
-                        }, `${{ draft: "草稿", draftbox: "草稿箱", published: "已发布" }[a.lifecycle.value] ?? a.lifecycle.value}${a.lifecycle.source === "manual" ? "·手" : ""}`)
+                          title: a.lifecycle.source === "manual" ? "你自己标的" : "没标过，默认算草稿",
+                        }, `${{ draft: "草稿", published: "已发布" }[a.lifecycle.value] ?? a.lifecycle.value}${a.lifecycle.source === "manual" ? "·手" : ""}`)
                         : null,
                       // 赛道：一眼看出这篇按哪套口径写的（医疗和职场不能同一套说法）
                       a.track
@@ -6156,19 +6947,23 @@ window.__ModuleLoader__.load({
                         : null,
                       h("span", null, a.empty ? "空壳" : `${a.sections ?? 0} 段 · ${a.words ?? 0} 字`),
                       h("span", null, `${a.images ?? 0} 图`),
-                      a.template ? h("span", null, a.template) : null,
+                      // 模板显示中文名：卡片上写「business」是给开发看的，用户认的是「商务简报」。
+                      a.template ? h("span", null, templateName(templates, a.template)) : null,
                       h("span", null, timeText(a.updatedAt)))));
               }),
               h("button", { className: "gzs-card gzs-card--new", onClick: onCreate }, "＋ 新建一篇"))
             : (stat.total ?? 0) === 0
-              // 空库：三步开始（新建 / 配节点 / 连公众号）。
+              // 空库：一句话入口（不教配置）。见 Welcome 的注释。
               ? h("div", { className: "gzs-blank" },
                 h("b", null, "还没有任何文章"),
-                h("p", null, "从下面任一件事开始就行。不用先想清楚全部——标题、段落、配图后面都能改。"),
-                h(FirstRun, {
+                h("p", null, "不用先想清楚全部——标题、段落、配图后面都能改。"),
+                h(Welcome, {
                   onCreate,
-                  onConfigureNodes: () => onConfigureNodes?.(),
-                  onConfigureWechat: () => onConfigureWechat?.(),
+                  onOpenExample: () => onOpenExample?.(),
+                  chatOpen,
+                  chatReady,
+                  onOpenChat,
+                  onGoVideo,
                 }))
               // 库里有稿、只是筛没了：说清「是筛出来的 0 篇」，并给一键清筛选。
               : h("div", { className: "gzs-blank" },
@@ -6510,68 +7305,6 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 新建表单：把「讲给谁、讲什么、想带走什么」一次填清（Deckline 那个起手式）。
-     * 段数只是先摆好空段落，讲稿本身还是人/Agent 写——工作台不假装会写稿。
-     */
-    function NewArticle({ templates, tracks, onCreate, onCancel, busy }) {
-      const [title, setTitle] = React.useState("");
-      const [audience, setAudience] = React.useState("");
-      const [takeaway, setTakeaway] = React.useState("");
-      const [sections, setSections] = React.useState(4);
-      const [template, setTemplate] = React.useState(templates?.[0]?.id ?? "business");
-      // 赛道决定「按哪套口径写」：换赛道顺手把模板切到它建议的那套（用户仍可再改）。
-      const [track, setTrack] = React.useState("");
-      const trackList = Array.isArray(tracks) ? tracks : [];
-      const onTrack = (id) => {
-        setTrack(id);
-        const pack = trackList.find((item) => item.id === id);
-        if (pack?.defaultTemplate) setTemplate(pack.defaultTemplate);
-      };
-      return h("div", { className: "gzs-home" },
-        h("div", { className: "gzs-formwrap" },
-          h("div", { className: "gzs-homehead" },
-            h("div", null,
-              h("div", { className: "gzs-hometitle" }, "新建一篇"),
-              h("div", { className: "gzs-hint", style: { marginTop: 4 } },
-                "先把「讲什么、给谁、带走什么」写清楚；段落和配图后面都能改，这几项定了才好写。"))),
-          h("div", { className: "gzs-formcard" },
-            h(Field, { label: "内容类型（可选，决定合规口径与默认长相）" },
-              h("select", {
-                className: "gzs-select", style: { width: "100%", maxWidth: "none" },
-                value: track, onChange: (e) => onTrack(e.target.value),
-              }, [
-                h("option", { key: "", value: "" }, "通用（不套内容类型）"),
-                ...trackList.map((item) => h("option", { key: item.id, value: item.id },
-                  `${item.name} · ${item.tierLabel}${item.custom ? " · 自定义" : ""}`)),
-              ]),
-              track
-                ? h("div", { className: "gzs-hint", style: { marginTop: 4 } },
-                  (trackList.find((item) => item.id === track)?.tone ?? "") || "已选内容类型")
-                : h("div", { className: "gzs-hint", style: { marginTop: 4 } },
-                  "通用模式：不选也能写、能出图、能推。想加自己的内容类型，把一份 JSON 放进 ~/.dsh/gzh-studio/tracks/。")),
-            h(Field, { label: "标题（先写个工作的，后面随时改）" },
-              h("input", { className: "gzs-input", value: title, onChange: (e) => setTitle(e.target.value), placeholder: "例：一家药企把审批从 14 天压到 3 天" })),
-            h(Field, { label: "讲给谁" },
-              h("input", { className: "gzs-input", value: audience, onChange: (e) => setAudience(e.target.value), placeholder: "例：正在做数字化的药企 IT 负责人" })),
-            h(Field, { label: "想让人带走什么" },
-              h("input", { className: "gzs-input", value: takeaway, onChange: (e) => setTakeaway(e.target.value), placeholder: "例：知道自建审批流的两个坑" })),
-            h("div", { className: "gzs-row", style: { gap: 14, alignItems: "flex-start" } },
-              h("div", { style: { flex: "0 0 132px" } },
-                h(Field, { label: "先摆几段" },
-                  h("input", {
-                    className: "gzs-input", type: "number", min: 1, max: 24, value: sections,
-                    onChange: (e) => setSections(Math.max(1, Math.min(24, Number(e.target.value) || 1))),
-                  }))),
-              h("div", { className: "gzs-grow" },
-                h(Field, { label: "排版模板" },
-                  h("select", { className: "gzs-select", style: { width: "100%", maxWidth: "none" }, value: template, onChange: (e) => setTemplate(e.target.value) },
-                    (templates ?? []).map((t) => h("option", { key: t.id, value: t.id }, t.name)))))),
-            h("div", { className: "gzs-formacts" },
-              h(Btn, { kind: "primary", disabled: busy, on: () => onCreate({ title, audience, takeaway, sections, template, track }) }, "建好，开始写"),
-              h(Btn, { kind: "ghost", on: onCancel }, "取消")))));
-    }
-
-    /**
      * 左栏原生对话的开关状态，做成模块级 store。
      *
      * 提它到模块级是为了「带到对话」：右栏点一下，得先把左栏展开、再往那边的
@@ -6696,13 +7429,43 @@ window.__ModuleLoader__.load({
        */
       const heldRef = React.useRef(null);
       const tagRef = React.useRef(null);
+      /**
+       * 等着被释放的引用（先卸下 UI，再 release）。
+       *
+       * 2026-11-07 实测抓到的一条：切内容线（公众号 → 视频号 → 公众号）时控制台抛
+       * `Error: Session reference "..." is released`，来源是宿主在**读一个已经释放的引用**
+       * ——我们 release 的那一刻，`SessionProvider` 还挂在树上。旧代码注释里记的那次
+       * 「面板整块消失」也是同一个病。
+       *
+       * 所以改成两步：换条件时先把 `reference` 置空（宿主把对话卸掉），
+       * 等这次渲染过去，再真正 `release()`。释放晚一拍没有代价，早一拍就会崩。
+       */
+      const retiringRef = React.useRef([]);
+      const flushRetired = React.useCallback(() => {
+        const list = retiringRef.current;
+        retiringRef.current = [];
+        for (const item of list) {
+          try { item?.release?.(); } catch { /* 已经放掉了 */ }
+        }
+      }, []);
+      /** 把当前按住的引用挪进待释放队列，**不立即 release**。 */
+      const retireHeld = React.useCallback(() => {
+        if (heldRef.current) retiringRef.current.push(heldRef.current);
+        heldRef.current = null;
+        tagRef.current = null;
+      }, []);
       const dropHeld = React.useCallback(() => {
         try { heldRef.current?.release?.(); } catch { /* 已经放掉了 */ }
         heldRef.current = null;
         tagRef.current = null;
-      }, []);
+        flushRetired();
+      }, [flushRetired]);
       // 面板卸载才释放引用（依赖为空：dropHeld 的 identity 稳定）
       React.useEffect(() => () => dropHeld(), [dropHeld]);
+      // 对话已经从 DOM 上卸下来了，这时候再放才安全。见 retiringRef 的注释。
+      React.useEffect(() => {
+        if (reference === null) flushRetired();
+      }, [reference, flushRetired]);
 
       React.useEffect(() => {
         if (!enabled) return undefined;
@@ -6716,8 +7479,12 @@ window.__ModuleLoader__.load({
           return undefined;
         }
         const tag = `${line}|${normalizeChatPath(repoRoot)}|${workspaceId ?? ""}`;
-        // 条件变了（换了线 / 换了仓根 / 换了工作区 / 点了重开）→ 旧的引用作废
-        if (tagRef.current !== null && tagRef.current !== tag) dropHeld();
+        // 条件变了（换了线 / 换了仓根 / 换了工作区 / 点了重开）→ 旧的引用作废。
+        // 顺序必须是「先让 UI 卸下 -> 等渲染 -> 再 release」，见 retiringRef 的注释。
+        if (tagRef.current !== null && tagRef.current !== tag) {
+          setReference(null);
+          retireHeld();
+        }
         // 同一条线已经拿住了：直接把现成的引用交出去，不重开也不释放
         if (heldRef.current && tagRef.current === tag) {
           setReference(heldRef.current);
@@ -6803,11 +7570,13 @@ window.__ModuleLoader__.load({
       /** 重开：忘掉这条线的会话，从崭新的一条开始。 */
       const reset = React.useCallback(() => {
         try { window.localStorage.removeItem(`${CHAT_KEY}.${line}`); } catch { /* 同上 */ }
-        dropHeld();
+        // 同样是「先卸下、后释放」：重开时 SessionProvider 还挂着旧引用，
+        // 一 release 宿主就会读到已释放的引用（见 retiringRef 的注释）。
         setReference(null);
+        retireHeld();
         setProblem(null);
         setNonce((value) => value + 1);
-      }, [line, dropHeld]);
+      }, [line, retireHeld]);
       return { reference, problem, reset };
     }
 
@@ -6856,15 +7625,32 @@ window.__ModuleLoader__.load({
      * 平白多出一行「新对话」，而用户根本没打算聊。
      */
     function ChatDock(props) {
-      const { reference, problem, onReset, onClose, running, SessionProvider, renderSlot, label } = props;
+      const { reference, problem, onReset, onClose, running, SessionProvider, renderSlot, label,
+        workspaces = [], workspaceId = null, onPickWorkspace } = props;
       const ready = typeof SessionProvider === "function" && typeof renderSlot === "function";
+      // 只有一条可选时不必给选择器：一个只能点的、只有一个选项的下拉比没有更糟。
+      // 「默认工作区」在宿主里的 title 是 id（default-workspace），下拉里得说人话。
+      const wsLabel = (ws) => {
+        if (!ws) return "";
+        if (ws.workspaceId === "default-workspace") return "默认工作区";
+        return String(ws.title || ws.path || ws.workspaceId);
+      };
+      const picker = workspaces.length > 1
+        ? h("select", {
+          className: "gzs-chatws",
+          title: "这条对话绑哪个工作区（= 对话的工作目录）。换一个就等于换一个上下文。",
+          value: workspaceId ?? "",
+          onChange: (event) => onPickWorkspace?.(event.target.value),
+        }, workspaces.map((ws) => h("option", { key: ws.workspaceId, value: ws.workspaceId }, wsLabel(ws))))
+        : null;
       return h("div", { className: "gzs-chatdock" },
         h("div", { className: "gzs-chatcol__bar" },
           h("span", { className: "gzs-chatcol__t" }, "DSH 原生对话"),
+          picker,
           h("span", { className: "gzs-chatcol__ctx", title: label }, label),
           running
             ? h("span", { className: "gzs-chatrun" }, h("span", { className: "gzs-chatdot" }), "在跑")
-            : h("span", { className: "gzs-chatcol__s" }, "带到对话只填入，不自动发送"),
+            : h("span", { className: "gzs-chatcol__s" }, "在这里说 · 右边看板"),
           h("button", { className: "gzs-chatcol__x", title: "重开一条崭新对话", onClick: onReset }, "重开"),
           h("button", { className: "gzs-chatcol__x", title: "收起对话，面板占满", onClick: onClose }, "×")),
         h("div", { className: "gzs-chatbody" },
@@ -6920,10 +7706,27 @@ window.__ModuleLoader__.load({
       if (!body.trim()) return { ok: false, reason: "内容是空的" };
       const host = findComposer();
       if (!host) return { ok: false, reason: "没找到输入框（左栏还没加载完？）" };
-      const lands = () => String(host.textContent ?? "").replace(/\s+/g, "").includes(body.replace(/\s+/g, "").slice(0, 8));
+      const want = body.replace(/\s+/g, "");
+      /**
+       * 已经在了就别再塞一遍——但要比**整句话**，不能只比开头八个字。
+       *
+       * 踩过（0.3.2 验收）：所有面板递话都以「【新媒体工作台】」开头，只比前 8 个字的话，
+       * 输入框里已经有上一条时，新的一条会被判成"已经在了"，点了没反应。
+       */
+      const already = () => String(host.textContent ?? "").replace(/\s+/g, "").includes(want);
+      const lands = () => already();
+      if (already()) return { ok: true, via: "already" };
       try { host.focus(); } catch { /* 焦点拿不到也继续试 */ }
 
-      try { if (document.execCommand("insertText", false, body) && lands()) return { ok: true, via: "execCommand" }; } catch { /* 往下试 */ }
+      /**
+       * ① execCommand：Chrome 下触发 beforeinput，编辑器按正常打字处理（带撤销栈）。
+       *
+       * **不再同步复核**。踩过的坑：Lexical 的 DOM 是下一拍才更新的，`execCommand`
+       * 返回 true 之后立刻读 `textContent` 还是旧值 → 复核判失败 → 外层 500ms 重试
+       * 再插一遍 → 最后输入框里是同一句话连了三遍。execCommand 返回 true 就是
+       * "命令执行了、文档被改了"，这个语义够用；宁可少一次复核，也不要三份稿子。
+       */
+      try { if (document.execCommand("insertText", false, body)) return { ok: true, via: "execCommand" }; } catch { /* 往下试 */ }
       try {
         const editor = host.__lexicalEditor;
         if (editor?.dispatchCommand && editor.dispatchCommand("INSERT_TEXT", body) && lands()) return { ok: true, via: "lexical" };
@@ -7060,9 +7863,9 @@ window.__ModuleLoader__.load({
     exports.Workspace = Workspace;
     exports.MainPanel = MainPanel;
     exports.PhonePreview = PhonePreview;
+    exports.PhonePane = PhonePane;
     exports.Outline = Outline;
     exports.Inspector = Inspector;
-    exports.NewArticle = NewArticle;
     exports.Home = Home;
     exports.Governance = Governance;
     exports.currentVersion = currentVersion;
@@ -7084,7 +7887,7 @@ window.__ModuleLoader__.load({
     exports.StepRail = StepRail;
     exports.Stage = Stage;
     exports.Manuscript = Manuscript;
-    exports.ExportBar = ExportBar;
+    exports.ExportMenu = ExportMenu;
     exports.GateList = GateList;
     exports.ImageBoard = ImageBoard;
     exports.STEP_NAMES = STEP_NAMES;
@@ -7092,6 +7895,8 @@ window.__ModuleLoader__.load({
     exports.OpinionComposer = OpinionComposer;
     exports.RepoSection = RepoSection;
     exports.RepoPreview = RepoPreview;
+    // 往期正文的白名单重建：**纯字符串**，不需要 DOM，`verify/sanitize-unit.mjs` 直接调它
+    exports.sanitizeRichHtml = sanitizeRichHtml;
     exports.VideoBoard = VideoBoard;
     exports.VideoEpisode = VideoEpisode;
     exports.EpisodePlayer = EpisodePlayer;
@@ -7108,12 +7913,6 @@ window.__ModuleLoader__.load({
     exports.readCols = readCols;
     exports.saveCols = saveCols;
     exports.ROUTES = ROUTES;
-    // 推草稿对话框：单测直接渲染它（没配公众号时是配置向导，配好了是推前自查）
-    exports.PushDialog = PushDialog;
-    exports.PublishPackDialog = PublishPackDialog;
-    exports.PLATFORM_SPECS = PLATFORM_SPECS;
-    exports.platformPack = platformPack;
-    exports.targetsFromDraft = targetsFromDraft;
     exports.ProposalBlock = ProposalBlock;
     exports.healResizeCursor = healResizeCursor;
     exports.parseCssColor = parseCssColor;
@@ -7124,11 +7923,11 @@ window.__ModuleLoader__.load({
     exports.tintWeightFor = tintWeightFor;
     exports.sampleBackdrop = sampleBackdrop;
     exports.applyThemeTo = applyThemeTo;
-    exports.LastPublishNotice = LastPublishNotice;
-    exports.FirstRun = FirstRun;
+    exports.Welcome = Welcome;
+    exports.StepsBoard = StepsBoard;
+    exports.ExampleSheet = ExampleSheet;
+    exports.EXAMPLE_VIEW = EXAMPLE_VIEW;
     exports.TodayQueue = TodayQueue;
-    exports.NodeDialog = NodeDialog;
-    exports.wechatConfigPayload = wechatConfigPayload;
     exports.VIDEO_STEPS = VIDEO_STEPS;
     exports.markdownBlocks = markdownBlocks;
     // 左栏原生对话（会话内嵌形态）+ 只递话不发送的填字通道

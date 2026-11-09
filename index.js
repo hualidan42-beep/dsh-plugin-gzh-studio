@@ -10,23 +10,25 @@
  * @module dsh-plugin-gzh-studio
  */
 
-import { readFile, stat, readdir } from "node:fs/promises";
+import { readFile, stat, readdir, rename } from "node:fs/promises";
 import { watch, mkdirSync, createReadStream, readFileSync } from "node:fs";
+import { mkdir } from "node:fs/promises";
 import { Readable } from "node:stream";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createStore, checkId, checkSlot, checkVid, DEFAULTS, makeSection, nextVid, emptySlot } from "./lib/store.js";
+import { createStore, checkId, checkSlot, checkVid, DEFAULTS, makeSection, nextVid, nextSectionId, emptySlot } from "./lib/store.js";
 import { runQa } from "./lib/qa.js";
 import { TEMPLATES, TEMPLATE_IDS, DEFAULT_TEMPLATE } from "./lib/templates.js";
 import {
   renderWechatBody, renderMarkdown, renderChecklistText, imageChecklist, pickVersion,
 } from "./lib/render.js";
-import { generateImage, describeNode, defaultSizeFor } from "./lib/generate.js";
+import { generateImage, describeNode, checkNodeTarget, defaultSizeFor, probeSize } from "./lib/generate.js";
+import { findImageModel, generateWithHost } from "./lib/hostImage.js";
+import * as wechat from "./lib/wechat.js";
 import * as pipeline from "./lib/pipeline.js";
 import * as stock from "./lib/stock.js";
 import * as repo from "./lib/repo.js";
 import * as video from "./lib/video.js";
-import * as wechat from "./lib/wechat.js";
 import * as trackLib from "./lib/tracks.js";
 import { markLifecycle, lifecycleOf } from "./lib/store.js";
 import {
@@ -45,8 +47,8 @@ import {
 /** 稳定 Cordis 插件名。 */
 export const name = "gzh-studio";
 
-/** 激活前需要的服务。 */
-export const inject = ["connection"];
+/** 激活前需要的服务。`llm` 用于出图时借宿主已配好的模型（见 lib/hostImage.js）。 */
+export const inject = ["connection", "llm"];
 
 /** 本插件向服务树提供的服务。 */
 export const provide = ["gzhStudio"];
@@ -60,6 +62,11 @@ export const ROUTES = {
   state: "/api/gzh-studio.state",
   article: "/api/gzh-studio.article",
   create: "/api/gzh-studio.create",
+  // 删一篇：移到回收站（不硬删），需要重启 dsh web 才会挂上这条
+  remove: "/api/gzh-studio.remove",
+  // 推草稿箱：状态（配没配）与真推一次。同样需要重启后才有。
+  wechatStatus: "/api/gzh-studio.wechatStatus",
+  push: "/api/gzh-studio.push",
   save: "/api/gzh-studio.save",
   script: "/api/gzh-studio.script",
   generate: "/api/gzh-studio.generate",
@@ -78,16 +85,14 @@ export const ROUTES = {
   review: "/api/gzh-studio.review",
   // 实时同步（SSE）：写盘事件推给面板。浏览器半收不到就退回手动刷新。
   stream: "/api/gzh-studio.stream",
-  // 推草稿：公众号凭据 / 推一次 / 自查（不联网）
-  wechatStatus: "/api/gzh-studio.wechatStatus",
-  wechatConfig: "/api/gzh-studio.wechatConfig",
-  push: "/api/gzh-studio.push",
   // 真源仓库（只读）：稿件列表 / 单篇 / 视频期 / 质量门。字段名以
   // `design/contract-gzh-workbench.md` 的路由契约为准，别在这里改名。
   repo: "/api/gzh-studio.repo",
   repoArticle: "/api/gzh-studio.repoArticle",
   video: "/api/gzh-studio.video",
   videoEpisode: "/api/gzh-studio.videoEpisode",
+  // 视频期目录的两个动作：指到已有目录（path）/ 建出约定目录（create）
+  videoSetup: "/api/gzh-studio.videoSetup",
   // 视频期里的媒体文件（成片 / 封面 / 分镜图 / 字幕）：支持 Range，<video> 才能拖进度条。
   media: "/api/gzh-studio.media",
   gate: "/api/gzh-studio.gate",
@@ -171,7 +176,8 @@ export function applyPatch(article, patch) {
       let section = id ? article.sections.find((s) => s.id === id) : null;
       if (!section) {
         if (article.sections.length >= 24) continue;
-        section = makeSection({ index: article.sections.length });
+        // 新增段落的 id 由现有最大序号推出来，不能拿「当前长度 + 1」——删过段就会撞号。
+        section = makeSection({ id: nextSectionId(article.sections) });
         article.sections.push(section);
       }
       if (heading !== undefined && section.heading !== heading) {
@@ -241,44 +247,6 @@ export function applyPatch(article, patch) {
     }
   }
 
-  /**
-   * 平台版本（一稿多投）：只存**差异**——平台标题 / 正文 / 话题。
-   *
-   * 四条口径：
-   * 1. 正文只有一份真源（`article.sections`），这里存的是「按平台裁过的那一版」；
-   * 2. 按平台去重（同平台只留第一条），最多 8 个，避免手抖写出重复平台；
-   * 3. 每项都裁长——不然一次「全部保存」会把整篇文章复制成四五份塞进 article.json；
-   * 4. 传空数组等于清空（回到「用原稿」）。
-   */
-  if (Array.isArray(input.targets)) {
-    const seen = new Set();
-    const next = [];
-    for (const raw of input.targets.slice(0, 8)) {
-      if (!raw || typeof raw !== "object") continue;
-      const platform = String(raw.platform ?? "").trim().slice(0, 32);
-      if (!/^[a-z][a-z0-9-]{1,31}$/.test(platform) || seen.has(platform)) continue;
-      seen.add(platform);
-      const item = { platform };
-      if (typeof raw.title === "string" && raw.title.trim()) item.title = raw.title.trim().slice(0, 200);
-      if (typeof raw.body === "string" && raw.body.trim()) item.body = raw.body.trim().slice(0, 20_000);
-      if (Array.isArray(raw.hashtags)) {
-        const tags = raw.hashtags
-          .map((tag) => String(tag ?? "").trim().slice(0, 40))
-          .filter(Boolean)
-          .slice(0, 20);
-        if (tags.length) item.hashtags = tags;
-      }
-      // 空壳不留：只有平台名的条目等于「没覆盖」，存下来只会让用户以为已经保存过
-      if (!item.title && !item.body && !item.hashtags) continue;
-      next.push(item);
-    }
-    const before = Array.isArray(article.targets) ? article.targets : [];
-    if (JSON.stringify(before) !== JSON.stringify(next)) {
-      if (next.length) article.targets = next;
-      else delete article.targets;
-      changed.push("targets");
-    }
-  }
 
   // 生命周期：草稿 / 草稿箱 / 已发布。人显式标的那条路。
   // **只有人能标**：账户没接公众号 API，机器无从知晓是否真的发布了。
@@ -318,8 +286,20 @@ export function applyPatch(article, patch) {
         changed.push("pipeline:unbound");
       }
     } else {
+      // 期号与根目录最终都会变成路径的一段：在**绑定时**就拦住越界写法，
+      // 而不是等 `/pipeline` 去读盘时才失败——那时脏值已经留在 article.json 里了。
+      const safeEpisode = pipeline.checkEpisodeId(episodeId);
+      if (!safeEpisode) {
+        throw Object.assign(new Error("期号不合法：不能含路径分隔符、`..`、Windows 非法字符，最长 80 字符"), { status: 400 });
+      }
+      if (root) {
+        if (!isAbsolute(root)) throw Object.assign(new Error("流水线根目录必须是绝对路径"), { status: 400 });
+        if (root.split(/[\\/]+/).some((part) => part === "..")) {
+          throw Object.assign(new Error("流水线根目录不合法：不能含 `..`"), { status: 400 });
+        }
+      }
       article.pipeline = {
-        episodeId,
+        episodeId: safeEpisode,
         root,
         articleHash: pipeline.articleHash(article),
         boundAt: Date.now(),
@@ -332,14 +312,39 @@ export function applyPatch(article, patch) {
 }
 
 /**
+ * 出图模型：显式配置优先（`settings.imageModel` 写 `provider/model`），否则在模型目录里找 id 带 image 的。
+ * @param {{imageModel?: string}} settings
+ */
+function imageModelOf(settings) {
+  const raw = String(settings?.imageModel ?? "").trim();
+  if (!raw) return null;
+  const [provider, ...rest] = raw.split("/");
+  const model = rest.join("/");
+  if (!provider || !model) return null;
+  return { provider, model, label: raw };
+}
+
+/** 把尺寸说成人话拼进 prompt：多数出图模型不认 `size` 参数，只认提示词里的比例描述。 */
+function imagePromptOf(prompt, size) {
+  const matched = /^(\d+)x(\d+)$/.exec(String(size ?? ""));
+  if (!matched) return prompt;
+  const width = Number(matched[1]);
+  const height = Number(matched[2]);
+  const ratio = width === height ? "正方形" : width > height ? `横版 ${width}:${height}` : `竖版 ${width}:${height}`;
+  return `${prompt}\n\n画面：${ratio}构图，${width}×${height}；不要文字、不要水印、不要拼贴。`;
+}
+
+/**
  * 服务体：把落盘 / 出图 / 导出编成方法，`ctx.provide` 之后其它插件也能直接调。
  * @param {{root: string, ledgerLimit: number}} config
  * @param {{info?: Function, warn?: Function}} logger
  */
-export function createService(config, logger = {}) {
+export function createService(config, logger = {}, deps = {}) {
   const store = createStore(config);
-  // 公众号推送客户端：配置与 token 都落在同一个数据目录里。
-  // `fetchImpl` 可注入（测试用本地假服务器跑整条链路，不出网）。
+  // 宿主模型服务（`ctx.llm`）。没传就是「这台机器没有模型可用」——
+  // 单测与离线环境走这条路，出图会明确报「还没有能出图的模型」，而不是假装成功。
+  const llm = deps.llm ?? null;
+  // 公众号草稿箱客户端：只读 ~/.dsh/gzh-studio/wechat.json（AppID / AppSecret / 作者）
   const wechatClient = wechat.createClient({ root: store.root, logger });
 
   /**
@@ -398,8 +403,7 @@ export function createService(config, logger = {}) {
     const settings = await store.readSettings();
     // 推草稿回执：哪些 id 真的推过草稿箱。「草稿箱」这个生命周期靠它推出来，
     // 不靠人记——一次查全，别在列表循环里逐篇去读盘。
-    const draftPushed = await store.idsWithDraftReceipt();
-    const articles = await store.listArticles({ draftPushed });
+    const articles = await store.listArticles();
     const view = stock.stock(articles, {
       // 原样传进去，让 stock 自己校验并标出「条件写错了」。
       // 这里先 checkState 一次会把非法值滤成空串，stock 就分不清「没筛」和「写错了」——
@@ -454,8 +458,16 @@ export function createService(config, logger = {}) {
         nodes: await nodesView(),
         // 绑期号时给个默认根目录，省得每次手输；settings 里没写就用空串（前端会提示必填）
         pipelineRoot: settings.pipelineRoot ?? "",
+        // 期目录：空串 = 约定值。同时把**解析后**的绝对路径给出去，面板照它显示，
+        // 不必在前端再拼一遍 `07-video/episode`（拼就要和宿主保持同步，迟早对不上）。
+        episodesRoot: settings.episodesRoot ?? "",
+        episodesRootResolved: repo.episodesRoot(),
       },
       templates: TEMPLATES,
+      // 真源仓库配了没：面板据此决定要不要显示「视频号」那一栏。
+      // 不给这个字段，前端就只能先打一次 /video 去猜，或者永远露着一个点进去是空的入口——
+      // 新用户第一眼看到「八步缺口 / 还没选期」，最可能的反应是「看不懂」而不是「我去配仓库」。
+      repoConfigured: repo.repoConfigured(),
       generatedAt: Date.now(),
     };
   }
@@ -575,13 +587,11 @@ export function createService(config, logger = {}) {
     if (!article) return null;
     const ledger = await store.readLedger(id);
     const reviewDoc = await store.readReviews(id);
-    // 推草稿回执：单篇视图也要能显示「已进草稿箱」，而且标明是推断出来的。
-    const draftPushed = ledger.some((row) => row?.type === "publish" && row.persisted !== false);
     // 赛道包（含用户自定义）：没选就是 null，面板据此显示「未选择赛道」。
     const track = trackLib.trackOf(article.track, await tracksAll());
     return {
       article,
-      lifecycle: lifecycleOf(article, { draftPushed }),
+      lifecycle: lifecycleOf(article),
       qa: await qaOf(article),
       track: track ? trackLib.tracksView([track])[0] : null,
       ledger,
@@ -689,46 +699,105 @@ export function createService(config, logger = {}) {
     const finalPrompt = `${stylePrefix}${prompt}${suffix}`;
 
     const settings = await store.readSettings();
-    // 节点顺序：**显式指定就只试那一个**（尊重人的选择，别偷偷换节点）；
-    // 没指定就默认节点打头，后面跟其余可用节点——一个额度不够自动切下一个。
-    const explicit = typeof input.node === "string" && input.node
-      ? settings.nodes.find((n) => n.id === input.node) ?? null
-      : null;
-    const defaultNode = settings.nodes.find((n) => n.id === settings.defaultNode) ?? settings.nodes[0];
-    const ordered = explicit ? [explicit] : [defaultNode, ...settings.nodes.filter((n) => n.id !== defaultNode.id)];
-    const usable = ordered.filter((node) => describeNode(node).usable);
-    // 配置层面就不可用的节点（缺 key / 没填 baseURL）不算"试过"，但要记下来：
-    // 否则面板只看到"切到 fake 了"，不知道是哪个节点为什么被跳过。
-    const skipped = ordered
-      .filter((node) => !describeNode(node).usable)
-      .map((node) => ({ id: node.id, name: node.name, reason: describeNode(node).reason }));
-    if (!usable.length) {
-      const why = ordered.map((node) => `${node.name}（${describeNode(node).reason}）`).join("；");
-      throw Object.assign(new Error(`没有可用节点：${why || "settings.json 里一个节点都没有"}`), { status: 400 });
-    }
-
     const preset = defaultSizeFor(slot);
     const size = /^\d+x\d+$/.test(String(input.size ?? "")) ? String(input.size) : target.size || preset.label;
     // 版本号用 store 的自增口径（跳号也往后走），占位图上的编号与落盘的一致
     const vid = nextVid(target.versions);
 
-    // 依次试着出图。每个失败都留下原因，**全挂了才抛**——抛出来的错要能看出试过谁。
+    // ── 出图路线 ──────────────────────────────────────────────────────────────
+    //
+    // 默认走**宿主自己的模型**：用户已经在 DSH 里配好了 provider 与 key，
+    // 插件没有理由再问一遍。这也把「让用户填 baseURL/apiKeyEnv」那条路彻底拆掉——
+    // 那条路一旦被滥用就是「把宿主进程里任意环境变量当 Bearer 发出去」。
+    //
+    // 仍然保留两条老路，各有明确理由：
+    // - `node: "fake"` → 占位图（不联网）。单测与首次跑通流程靠它，不需要任何模型；
+    // - 已经配了节点并且可用 → 照旧用节点（老用户升级后不出图断供）。
+    // 顺序：显式 fake > 宿主模型 > 已配节点 > 报错。
+    const explicit = typeof input.node === "string" && input.node
+      ? settings.nodes.find((n) => n.id === input.node) ?? null
+      : null;
+    const hostModel = explicit && explicit.id !== "fake" && explicit.fake !== true
+      ? null
+      : (imageModelOf(settings) ?? findImageModel(llm?.listProviders?.() ?? []));
+    const usableNodes = settings.nodes.filter((node) => describeNode(node).usable);
+    const wantFake = explicit?.fake === true;
+
     const tried = [];
     let image = null;
-    let node = usable[0];
-    for (const candidate of usable) {
-      try {
-        image = await generateImage(candidate, { slot, prompt: finalPrompt, negative, vid, size });
-        node = candidate;
-        break;
-      } catch (error) {
-        tried.push({ id: candidate.id, name: candidate.name, error: String(error?.message ?? error).slice(0, 160) });
-        logger.warn?.(`gzh-studio: 节点 ${candidate.id} 出图失败：${error?.message ?? error}`);
+    let node = null;
+
+    /**
+     * 「这次跳过了哪些节点」——和 `tried` 是两件事，别混：
+     *
+     * - `tried`：真去试了、失败了（网络 / 额度 / 模型报错）；
+     * - `skipped`：**配置层面就不可用**（没配环境变量、key 缺失），根本没试。
+     *
+     * 账本里少了这一项，用户看到图是 `fake` 出的、却不知道为什么没用自己的节点，
+     * 只能去翻设置。所以换节点这件事要留下证据。
+     */
+    const skipped = [];
+    if (!explicit) {
+      const defaultNode = settings.nodes.find((n) => n.id === settings.defaultNode) ?? settings.nodes[0] ?? null;
+      if (defaultNode && defaultNode.fake !== true && !describeNode(defaultNode).usable) {
+        skipped.push({ id: defaultNode.id, name: defaultNode.name, reason: describeNode(defaultNode).reason });
       }
     }
+
+    // 显式点名了一个真节点却不可用：**直接说清楚，不偷偷换人**。
+    // 「尊重人的选择」这条比「尽量出图」重要——换了节点出的图，用户会以为是那个节点出的。
+    if (explicit && explicit.fake !== true && !describeNode(explicit).usable) {
+      throw Object.assign(new Error(`节点「${explicit.name}」不可用：${describeNode(explicit).reason}`), { status: 400 });
+    }
+
+    if (wantFake) {
+      image = await generateImage(explicit, { slot, prompt: finalPrompt, negative, vid, size });
+      node = explicit;
+    }
+
+    if (!image && hostModel) {
+      try {
+        const produced = await generateWithHost(llm, {
+          provider: hostModel.provider,
+          model: hostModel.model,
+          prompt: imagePromptOf(finalPrompt, size),
+        });
+        const probe = probeSize(produced.bytes);
+        image = {
+          bytes: produced.bytes,
+          ext: produced.ext,
+          mime: produced.mime,
+          width: probe?.width ?? 0,
+          height: probe?.height ?? 0,
+          model: `${hostModel.provider}/${hostModel.model}`,
+          note: "",
+        };
+        node = { id: "host", name: hostModel.label };
+      } catch (error) {
+        tried.push({ id: "host", name: hostModel.label, error: String(error?.message ?? error).slice(0, 300) });
+        logger.warn?.(`gzh-studio: 宿主模型 ${hostModel.label} 出图失败：${error?.message ?? error}`);
+      }
+    }
+
+    if (!image && usableNodes.length) {
+      // 老路：节点逐个试，一个额度不够自动切下一个
+      for (const candidate of usableNodes) {
+        try {
+          image = await generateImage(candidate, { slot, prompt: finalPrompt, negative, vid, size });
+          node = candidate;
+          break;
+        } catch (error) {
+          tried.push({ id: candidate.id, name: candidate.name, error: String(error?.message ?? error).slice(0, 160) });
+          logger.warn?.(`gzh-studio: 节点 ${candidate.id} 出图失败：${error?.message ?? error}`);
+        }
+      }
+    }
+
     if (!image) {
       const detail = tried.map((t) => `${t.name}：${t.error}`).join("；");
-      throw Object.assign(new Error(`${tried.length} 个节点都没出成图 —— ${detail}`), { status: 502 });
+      throw Object.assign(new Error(tried.length
+        ? `没出成图 —— ${detail}`
+        : "这台机器上还没有能出图的模型：在 DSH 的模型设置里加一个出图模型（id 里带 image，例如 gpt-image-2），或者在对话里让我用占位图先跑通流程"), { status: 400 });
     }
 
     // prompt / negative 的槽位回写由 store.saveImage 负责（那里才是唯一写文章的地方）
@@ -761,8 +830,9 @@ export function createService(config, logger = {}) {
       // 槽位的 prompt 存的是**干净原文**（不带拼接），拼接只发生在发给模型的那一刻。
       feedback: carry.length ? carry.map((row) => row.key) : undefined,
       feedbackWords: carry.length ? carry.map((row) => row.verbatim) : undefined,
-      // 只有真的切过 / 跳过过节点才记，一次干净的普通出图不该多一行噪音
+      // 只有真的试失败过才记，一次干净的普通出图不该多一行噪音
       tried: tried.length ? tried : undefined,
+      // 配置层面就不可用、因此没去试的节点（与 `tried` 分开记，见上面的注释）
       skipped: skipped.length ? skipped : undefined,
     });
     logger.info?.(`gzh-studio: ${id} ${slot} → ${version.vid} (${node.id})${carry.length ? ` 带 ${carry.length} 条反馈` : ""}`);
@@ -775,6 +845,20 @@ export function createService(config, logger = {}) {
     if (!id) throw Object.assign(new Error("id 不合法"), { status: 400 });
     const article = await store.readArticle(id);
     if (!article) throw Object.assign(new Error("文章不存在"), { status: 404 });
+    /**
+     * 换内容类型同样要校验：写进去一个不存在的 id，这篇稿在首页分类里就消失了
+     * （chip 是按赛道包生成的）。空串是「改回通用」，合法，不用查。
+     */
+    const wantedTrack = typeof input.patch?.track === "string" ? input.patch.track.trim() : "";
+    if (wantedTrack) {
+      const list = await tracksAll();
+      if (!list.some((track) => track.id === wantedTrack)) {
+        throw Object.assign(
+          new Error(`未知内容类型「${wantedTrack}」。可用的 id：${list.map((t) => t.id).join("、")}`),
+          { status: 400 },
+        );
+      }
+    }
     const { article: next, changed } = applyPatch(article, input.patch);
     const saved = await store.writeArticle(next);
     if (changed.length) {
@@ -823,10 +907,20 @@ export function createService(config, logger = {}) {
 
     const kept = new Map((article.sections ?? []).map((s) => [s.id, s]));
     const next = [];
+    // 新增段落的 id 仍按位置起算（整表重写时 s1..sN 不动），但**撞号就往后让**：
+    // 删过段之后位置与现有 id 会错开（留下 s1、s3 时第 2 个新增会被推成 s3），
+    // 撞了以后两段共用同一个 id 与同一个配图槽位，后面每一步都会作用在错的那段。
+    const used = new Set();
+    const freeId = (start) => {
+      let n = Math.max(1, Number(start) || 1);
+      while (used.has(`s${n}`) && n < 9999) n += 1;
+      return `s${n}`;
+    };
     sections.slice(0, 24).forEach((incoming, index) => {
       const idMatch = typeof incoming?.id === "string" && /^s[0-9]{1,4}$/.test(incoming.id) ? incoming.id : null;
       const existing = idMatch ? kept.get(idMatch) : null;
-      const section = existing ?? makeSection({ index });
+      const section = existing ?? makeSection({ id: freeId(index + 1) });
+      used.add(section.id);
       section.heading = String(incoming?.heading ?? "").slice(0, 200);
       section.body = String(incoming?.body ?? "").slice(0, 20_000);
       next.push(section);
@@ -918,10 +1012,19 @@ export function createService(config, logger = {}) {
 
     const article = await store.readArticle(id);
     const proposal = await store.readProposal(id, pid);
+    // 对象没了是 404，内容漂移才是 409。以前两种都包成 409，客户端没法区分
+    // 「提案过期了，重看一遍」和「这篇/这份提案根本不存在」。
+    if (!article) throw Object.assign(new Error("文章不存在"), { status: 404 });
+    if (!proposal) throw Object.assign(new Error("提案不存在"), { status: 404 });
+    // 三态：只有显式 false 才是驳回。以前写成 `!== true`，漏传字段 / 传 "true" 字符串
+    // 都会走驳回分支——驳回是终态，一次字段写错就永久毁掉一份提案。
+    if (typeof input.confirmed !== "boolean") {
+      throw Object.assign(new Error("confirmed 必须是 true 或 false"), { status: 400 });
+    }
     const blocked = guardDecision(proposal, article);
     if (blocked) throw Object.assign(new Error(blocked), { status: 409 });
 
-    if (input.confirmed !== true) {
+    if (input.confirmed === false) {
       const decided = { ...proposal, status: PROPOSAL_STATUS.rejected, decidedAt: Date.now(), decidedBy: "user" };
       await store.writeProposal(id, decided);
       await store.appendLedger(id, proposalEvent(decided, "rejected", {
@@ -930,9 +1033,20 @@ export function createService(config, logger = {}) {
       return { proposal: { pid, status: decided.status }, article, qa: await qaOf(article), proposals: await proposalsSummary(id, article) };
     }
 
+    // 正文与提案状态是两个文件，写不出事务。顺序选「先正文、后提案」，
+    // 第二步失败就把正文写回裁决前那份并记一条失败事件：
+    // 宁可提案仍是「待确认」（用户再点一次即可），也不能留下「正文已改、提案还说没裁」的错位状态。
     const written = await writeScript({ id, ...proposal.next, note: `确认提案 ${pid}` });
     const decided = { ...proposal, status: PROPOSAL_STATUS.confirmed, decidedAt: Date.now(), decidedBy: "user" };
-    await store.writeProposal(id, decided);
+    try {
+      await store.writeProposal(id, decided);
+    } catch (error) {
+      await store.writeArticle(article).catch(() => {});
+      await store.appendLedger(id, {
+        type: "decide-failed", pid, note: `确认提案 ${pid} 时写提案状态失败，正文已回滚`,
+      }).catch(() => {});
+      throw Object.assign(new Error(`确认没落盘：${error?.message ?? error}；正文已回滚，提案仍是待确认`), { status: 500 });
+    }
     await store.appendLedger(id, proposalEvent(decided, "confirmed", {
       // 只记目标，不记全文——账本是索引，正文和对照在别处
       changed: (proposal.changes ?? []).map((item) => item.target),
@@ -959,6 +1073,17 @@ export function createService(config, logger = {}) {
     const sections = Array.isArray(article.sections) ? article.sections : [];
     const template = TEMPLATES.find((t) => t.id === article.template);
     const images = store.countImages(article);
+    /**
+     * 内容类型（赛道）：brief 里必须写清楚，并给出可选 id。
+     *
+     * 归类**不会自动发生**（2026-11-09 与作者确认的口径：手动选，不猜）。
+     * 但 Agent 起草时读的就是这份 brief——不在这里给它 id，它就没有地方知道
+     * `track` 该填什么，最后所有稿子都会掉进「通用」。所以这里把当前值、
+     * 可选清单、以及「判断不了就留空」一起给它。
+     */
+    const trackList = await tracksAll();
+    const trackId = String(article.track ?? "");
+    const trackName = trackId ? (trackList.find((t) => t.id === trackId)?.name ?? trackId) : "";
 
     const head = [
       `【公众号 brief】${article.id}`,
@@ -968,6 +1093,7 @@ export function createService(config, logger = {}) {
       `讲给谁：${article.audience || "（没填——起草前先问清楚）"}`,
       `想让人带走：${article.takeaway || "（没填）"}`,
       `禁忌（正文里不能出现）：${article.forbidden || "（无）"}`,
+      `内容类型：${trackName ? `${trackName}（${trackId}）` : "通用（还没归类）"}`,
       `排版模板：${template ? `${template.name}（${template.id}）` : article.template}`,
       `现状：${sections.length} 段，已出图 ${images} 张`,
     ].filter(Boolean);
@@ -984,7 +1110,13 @@ export function createService(config, logger = {}) {
       "1. 改稿走 POST /api/gzh-studio.propose 提提案，**不要直接 /save 或 /script**——那两个会当场覆盖正文；",
       "2. 提案只给逐段对照，人确认后才写入；提案过期（正文中间被改过）会被拒绝，需要重新提；",
       "3. 禁忌词命中会被 QA 报 error；要写就先去改「禁忌」那一栏，不要绕开检查。",
-    ];
+      trackId
+        ? `4. 这篇已归类为「${trackName}」，换类型才要动 track；不确定就先问，不要自己改。`
+        : `4. 这篇还没归类。如果你从标题/正文能明确判断它属于哪一类，就在 /save 的 patch.track 里带上对应 id；**判断不了就留空（通用），不要瞎猜**——猜错比不归类更难收拾。`,
+      trackList.length
+        ? `可选内容类型（id=名称）：${trackList.map((t) => `${t.id}=${t.name}`).join("、")}`
+        : "",
+    ].filter(Boolean);
 
     return [head.join("\n"), outline.join("\n"), rules.join("\n")].join("\n\n");
   }
@@ -1014,158 +1146,6 @@ export function createService(config, logger = {}) {
     return { body, contentType, filename: `${article.id}.${format === "md" ? "md" : format === "checklist" ? "txt" : "html"}` };
   }
 
-  // ── 推草稿 ──────────────────────────────────────────────────────────────────
-  //
-  // 三步，每步失败都要给人话：
-  // 1. **本地就能查的先查**（缺图 / 占位图 / 超长），不联网就把问题拦下来；
-  // 2. 传图：封面走永久素材拿 `media_id`，正文图走 `uploadimg` 拿 URL（外部 URL 会被微信过滤）；
-  // 3. 建草稿 + 落回执：`media_id` 进账本，生命周期推到「草稿箱」。
-  //
-  // `dryRun` 只做第 1 步：不联网也能自查「还差什么」，第一次配置时最有用。
-
-  /** 公众号推送状态（面板用来决定按钮是「推草稿」还是「先配一下」）。 */
-  async function wechatStatus() {
-    return wechatClient.status();
-  }
-
-  /** 保存公众号配置。只认白名单字段；AppSecret 传空串才是清掉。 */
-  async function saveWechatConfig(input = {}) {
-    const patch = {};
-    if (input.appId !== undefined) {
-      const appId = String(input.appId ?? "").trim();
-      if (appId && !/^wx[0-9a-zA-Z]{14,20}$/.test(appId)) {
-        throw Object.assign(new Error("AppID 看起来不对：一般是 wx 开头 + 16 位字符，去公众号后台复制完整那串"), { status: 400 });
-      }
-      patch.appId = appId;
-    }
-    if (input.appSecret !== undefined) patch.appSecret = String(input.appSecret ?? "").trim();
-    if (input.author !== undefined) patch.author = String(input.author ?? "");
-    if (input.mode !== undefined) patch.mode = input.mode === "gateway" ? "gateway" : "direct";
-    if (input.gateway !== undefined) {
-      patch.gateway = {
-        baseURL: String(input.gateway?.baseURL ?? "").trim(),
-        token: String(input.gateway?.token ?? "").trim(),
-      };
-    }
-    await wechatClient.writeConfig(patch);
-    return wechatClient.status();
-  }
-
-  /** 推一次草稿。返回 `{ mediaId, stats, images }`；dryRun 时不联网。 */
-  async function pushDraft(input = {}) {
-    const id = checkId(input.id);
-    if (!id) throw Object.assign(new Error("id 不合法：要推的那篇没选中，或 id 传错了"), { status: 400 });
-    const article = await store.readArticle(id);
-    if (!article) throw Object.assign(new Error("文章不存在"), { status: 404 });
-    const dryRun = input.dryRun === true;
-    const cfg = await wechatClient.config();
-    if (!dryRun && !cfg.usable) {
-      throw Object.assign(new Error("还没配好公众号：先填 AppID / AppSecret（或切到网关模式）"), { status: 400 });
-    }
-
-    const rows = imageChecklist(article);
-    if (!rows.some((row) => row.slot === "cover")) {
-      throw Object.assign(new Error("封面还没出图：公众号图文草稿必须有封面"), { status: 400 });
-    }
-
-    // 取图：缺文件在这里就报出来，别等传到一半。
-    const images = [];
-    for (const row of rows) {
-      const found = store.imagePath(article, row.slot, row.vid);
-      if (!found) {
-        throw Object.assign(new Error(`${row.label}：版本 ${row.vid} 的文件不在盘上`), { status: 400 });
-      }
-      let bytes = 0;
-      try { bytes = (await stat(found.path)).size; } catch { bytes = 0; }
-      images.push({ slot: row.slot, vid: row.vid, label: row.label, placeholder: row.placeholder, path: found.path, mime: found.mime, bytes });
-    }
-    const svgCount = images.filter((image) => /svg/i.test(image.mime)).length;
-    if (!dryRun && svgCount) {
-      throw Object.assign(new Error(`还有 ${svgCount} 张是占位图（SVG），公众号不认：先出真图再推`), { status: 400 });
-    }
-
-    const title = String(article.title ?? "").trim();
-    const digest = String(article.summary ?? "").trim().slice(0, wechat.LIMITS.digest);
-    const html = renderWechatBody(article).html;
-
-    // 先量一遍再传图：标题/摘要超限、正文明显超长，都不该先把几张图传上去再报错。
-    // 用一条 100 字符的假 URL 占位——真 URL 就这个量级，占位符只有 12 个字符会低估。
-    const FAKE_IMG_URL = "https://mmbiz.qpic.cn/mmbiz_png/0000000000000000000000000000/0?wx_fmt=png";
-    const preview = wechat.replacePlaceholders(html, Object.fromEntries(images.map((image) => [image.placeholder, FAKE_IMG_URL])));
-    const pre = wechat.checkDraft({ title, digest, content: preview });
-    if (!pre.ok) {
-      const error = Object.assign(new Error(pre.problems.map((problem) => problem.message).join("；")), { status: 400 });
-      error.problems = pre.problems;
-      error.stats = pre.stats;
-      throw error;
-    }
-
-    if (dryRun) {
-      return {
-        dryRun: true,
-        ok: true,
-        problems: [],
-        stats: { ...pre.stats, estimated: true },
-        images,
-        svgCount,
-        limits: wechat.LIMITS,
-        configured: cfg.usable,
-      };
-    }
-
-    // 传图 → 换占位符。封面同时要 media_id（建草稿用）和 URL（正文首图用）。
-    const replacements = {};
-    let thumbMediaId = "";
-    for (const image of images) {
-      // 一步失败要说清是**哪张**没传上去：一篇文章五六张图，只回「上传失败」等于没说。
-      try {
-        const buffer = await readFile(image.path);
-        if (image.slot === "cover") {
-          const uploaded = await wechatClient.uploadThumb(buffer, { filename: "cover.png", mime: image.mime });
-          thumbMediaId = uploaded.mediaId;
-          if (uploaded.url) replacements[image.placeholder] = uploaded.url;
-        } else {
-          replacements[image.placeholder] = await wechatClient.uploadContentImage(buffer, { filename: `${image.slot}.png`, mime: image.mime });
-        }
-      } catch (error) {
-        throw Object.assign(
-          new Error(`${image.label}（${image.vid}）没传上去：${error?.message ?? error}`),
-          { status: error?.status ?? 502, code: error?.code, ip: error?.ip, hint: error?.hint },
-        );
-      }
-    }
-
-    // 传完再量一次：真 URL 比假 URL 长，极限情况下（刚好卡线）这一遍才会发现。
-    const content = wechat.replacePlaceholders(html, replacements);
-    const check = wechat.checkDraft({ title, digest, content });
-    if (!check.ok) {
-      const error = Object.assign(new Error(check.problems.map((problem) => problem.message).join("；")), { status: 400 });
-      error.problems = check.problems;
-      error.stats = check.stats;
-      throw error;
-    }
-
-    const mediaId = await wechatClient.addDraft({ title, author: cfg.author, digest, content, thumbMediaId });
-    // 回执才算推过：**不写 article.lifecycle**（那是「人标的」），
-    // 而是落一条 `publish` 事件——列表和单篇都按回执推成「草稿箱 · 自动推断」。
-    await store.appendLedger(article.id, {
-      type: "publish",
-      persisted: true,
-      mode: "draft",
-      mediaId,
-      chars: check.stats.contentChars,
-      images: images.length,
-    });
-    return {
-      dryRun: false,
-      ok: true,
-      mediaId,
-      stats: check.stats,
-      images,
-      lifecycle: "draftbox",
-    };
-  }
-
   /** 只读重算：给面板「刷新状态」和 Agent 自己查进度用。 */
   async function pipelineOf(id) {    const article = await store.readArticle(checkId(id) ?? "");
     if (!article) throw Object.assign(new Error("文章不存在"), { status: 404 });
@@ -1176,7 +1156,7 @@ export function createService(config, logger = {}) {
   //
   // 这五条与上面那些**不是同一份数据**：上面读写的是工作台自己的库
   // （`~/.dsh/gzh-studio/articles`，可写），这里读的是内容生产的事实源
-  // （`<真源仓库>/social-media-management`，只读）。
+  // （`<真源仓库>`，只读）。
   // 两边将来要在面板上合并成一条，但合并是 UI 的事，宿主不替它合——
   // 合在宿主里，就再也分不清哪条是「库里的稿」、哪条是「盘上的稿」。
 
@@ -1190,9 +1170,97 @@ export function createService(config, logger = {}) {
     return repo.readArticle(dir);
   }
 
-  /** 视频号各期的进度与件。 */
+  /** 视频号各期的进度与件。`defaultDir` = 「创建默认目录」会建到哪儿（面板要照实写出来）。 */
   async function videoScan() {
-    return video.scanEpisodes();
+    return { ...(await video.scanEpisodes()), defaultDir: defaultEpisodesDir() };
+  }
+
+  /**
+   * 「创建默认目录」的落点：**插件自己的数据目录**，不是用户的内容仓库。
+   *
+   * 原来这里建的是 `<内容仓库>/07-video/episode`——`07-video` 是我这套仓库的编号习惯，
+   * 用户的内容仓库凭什么要有这一层？有人根本不写文章、只做视频；有人仓库结构完全不同。
+   * 所以默认目录归插件自己（和 `articles/`、`trash/` 同一个父目录），
+   * 不往用户的仓库里塞东西。想要放自己仓库里的，用「选择视频目录」指过去。
+   */
+  function defaultEpisodesDir() {
+    return join(store.root, "episodes");
+  }
+
+  /**
+   * 视频期目录的两种“指路”动作（面板空态上的两个按钮）。
+   *
+   * 为什么要有：原来空态只把「改哪个环境变量 / 改哪个 settings 字段」写在屏幕上，
+   * 用户看了不知道该动哪里——那是实现语言，不是操作。这里把两条路做成动作：
+   *
+   * - `path`：用户已经有素材，把**放各期的那一层目录**指过来（绝对路径，或相对仓库根的相对路径）；
+   * - `create`：用户还没有素材，就在**插件自己的数据目录**里建一个（`<数据目录>/episodes`）。
+   *
+   * 两个动作都**先校验再落盘**：指错了当场说清（不存在 / 不是目录 / 没权限），
+   * 不把无效路径存进去——存了之后每次打开都是空态，用户只会以为插件坏了。
+   * @param {{action?: string, path?: string}} input
+   */
+  async function setupVideo(input = {}) {
+    const action = String(input.action ?? "").trim();
+    const settings = await store.readSettings();
+
+    if (action === "create") {
+      const target = defaultEpisodesDir();
+      try {
+        await mkdir(target, { recursive: true });
+      } catch (error) {
+        throw Object.assign(
+          new Error(`建不出来这个目录：${target}（${error?.code ?? error?.message ?? "原因不明"}）`),
+          { status: 400 },
+        );
+      }
+      // 建成之后**显式记住这个绝对路径**：不记住的话，配了内容仓库的用户会被
+      // 「仓库/07-video/episode」这个兜底抢回去，白建一次。
+      settings.episodesRoot = target;
+      process.env[repo.EPISODES_ENV] = target;
+      await store.writeSettings(settings);
+      return { ok: true, root: target, defaultDir: target, ...(await video.scanEpisodes()) };
+    }
+
+    if (action === "path") {
+      const raw = String(input.path ?? "").trim().slice(0, 400);
+      if (!raw) throw Object.assign(new Error("请填写目录路径"), { status: 400 });
+      if (raw.split(/[\\/]+/).includes("..")) {
+        throw Object.assign(new Error("路径里不能有 ..（不允许指到外面去）"), { status: 400 });
+      }
+      // 相对路径按内容仓库根解析（那种写法本来就意味着「我有个仓库」）；
+      // 绝对路径独立使用，不需要仓库——有人只用视频这条线。
+      const rawRoot = repo.repoRoot();
+      let resolved;
+      if (isAbsolute(raw)) {
+        resolved = resolve(raw);
+      } else if (rawRoot) {
+        resolved = resolve(rawRoot, raw);
+      } else {
+        throw Object.assign(
+          new Error("没配内容仓库时只能填完整路径（例如 D:\\我的视频\\期目录）"),
+          { status: 400 },
+        );
+      }
+      let found = null;
+      try {
+        found = await stat(resolved);
+      } catch {
+        found = null;
+      }
+      if (!found) {
+        throw Object.assign(new Error(`这个路径不存在：${resolved}`), { status: 400 });
+      }
+      if (!found.isDirectory()) {
+        throw Object.assign(new Error(`这个路径不是文件夹：${resolved}`), { status: 400 });
+      }
+      settings.episodesRoot = isAbsolute(raw) ? resolved : raw;
+      process.env[repo.EPISODES_ENV] = settings.episodesRoot;
+      await store.writeSettings(settings);
+      return { ok: true, root: repo.episodesRoot(), defaultDir: defaultEpisodesDir(), ...(await video.scanEpisodes()) };
+    }
+
+    throw Object.assign(new Error(`不认识的视频目录动作：${action || "（空）"}`), { status: 400 });
   }
 
   /** 单期：口播稿 / 分镜 / 分段 / 字幕（缺件不抛错）。 */
@@ -1218,6 +1286,7 @@ export function createService(config, logger = {}) {
     repoScan,
     repoArticle,
     videoScan,
+    setupVideo,
     videoEpisode,
     gateOf,
     generate,
@@ -1393,6 +1462,11 @@ export function createService(config, logger = {}) {
           size: String(node.size ?? "").slice(0, 20),
           fake: Boolean(node.fake),
         };
+        // 危险写法当场拒（带凭证的内网地址、任意环境变量名）；只是没填完的允许存草稿。
+        const target = checkNodeTarget(clean, { strict: true });
+        if (!clean.fake && target.danger) {
+          throw Object.assign(new Error(`节点配置不可用：${target.reason}`), { status: 400 });
+        }
         const index = settings.nodes.findIndex((n) => n.id === clean.id);
         if (index >= 0) settings.nodes[index] = clean;
         else settings.nodes.push(clean);
@@ -1403,24 +1477,177 @@ export function createService(config, logger = {}) {
       if (typeof input.defaultTemplate === "string" && TEMPLATE_IDS.includes(input.defaultTemplate)) {
         settings.defaultTemplate = input.defaultTemplate;
       }
+      // 期目录：空串 = 回到约定值。写进来的值当场跑一遍 `episodesRoot()` 再看结果对不对，
+      // 免得存下一个 `..` 爬出去的路径、或者存了个 readdir 读不到的地方却一声不吭。
+      if (typeof input.episodesRoot === "string") {
+        const next = input.episodesRoot.trim().slice(0, 400);
+        settings.episodesRoot = next;
+        // 环境变量是运行时真值（`lib/repo.js` 只认它），存盘同时写进去，不用重启。
+        if (next) process.env[repo.EPISODES_ENV] = next;
+        else delete process.env[repo.EPISODES_ENV];
+      }
       await store.writeSettings(settings);
-      return { settings: { ...settings, nodes: await nodesView() } };
+      return {
+        settings: { ...settings, nodes: await nodesView() },
+        // 面板据此显示「我正在读哪个目录」，而不是让人去猜约定值
+        episodesRoot: repo.episodesRoot(),
+      };
     },
     /** 新建。input.sections 可以是段数，也可以是 `[{heading, body}]`。 */
     async create(input = {}) {
       const payload = { ...input };
-      // 选了赛道又没指定模板：用这条赛道的默认长相（医疗偏商务、母婴偏手账、AI 偏蓝图）。
-      if (payload.track && !payload.template) {
-        const track = trackLib.trackOf(payload.track, await tracksAll());
-        if (track?.defaultTemplate) payload.template = track.defaultTemplate;
+      /**
+       * 内容类型：**写进来就要能归到对应的栏**。
+       *
+       * 踩过的坑（2026-11-09 实测）：track 原来只校验格式（`[a-z][a-z0-9-]{1,31}`），
+       * 于是 `mother-baby` 这种拼错的 id 也能存下来——首页筛选条的 chip 是按
+       * 赛道包生成的，没有这个 id 的 chip，这篇稿就**永远筛不到**：
+       * 只在「全部」里看得见，分类里等于不存在。这比不归类更糟，所以当场 400。
+       */
+      if (payload.track) {
+        const list = await tracksAll();
+        const hit = list.find((track) => track.id === payload.track);
+        if (!hit) {
+          throw Object.assign(
+            new Error(`未知内容类型「${payload.track}」。可用的 id：${list.map((t) => t.id).join("、")}`),
+            { status: 400 },
+          );
+        }
+        // 选了赛道又没指定模板：用这条赛道的默认长相（医疗偏商务、母婴偏手账、AI 偏蓝图）。
+        if (!payload.template && hit.defaultTemplate) payload.template = hit.defaultTemplate;
       }
       const article = await store.createArticle(payload);
       return { article, qa: await qaOf(article) };
     },
+
+    /**
+     * 删掉一篇：**移到回收站，不硬删**。
+     *
+     * 为什么是移走而不是 rm：稿子里有正文、图版本、账本、勾选清单，删错一次就是
+     * 几个小时的工作。移到 `~/.dsh/gzh-studio/trash/<id>-<时间>/` 之后，
+     * 面板上立刻看不见（"真的删了"），但盘上还留着，想找回自己搬回去就行。
+     * 这也是唯一一个不需要撤销栈就能做到"可后悔"的做法。
+     */
+    /** 公众号推送状态：面板用它决定按钮是「推草稿箱」还是「先配一下」。密钥只回掩码。 */
+    async wechatStatus() {
+      return wechatClient.status();
+    },
+
+    /**
+     * 推一次草稿到公众号草稿箱。
+     *
+     * 三步，每步失败都要给人话：
+     * 1. **本地能查的先查**（封面有没有、图是不是 SVG 占位、标题/正文超没超限），不联网就拦下来；
+     * 2. 传图：封面走永久素材拿 media_id，正文图走 uploadimg 拿 URL（外链会被微信过滤）；
+     * 3. 建草稿 + 落回执（media_id 进账本）。
+     *
+     * 边界没变：**推的是草稿箱**，发表仍然要人去公众号后台点。这条线只到草稿为止。
+     * dryRun 只做第 1 步：不联网也能自查「还差什么」，第一次配的时候最有用。
+     */
+    async pushDraft(input = {}) {
+      const id = checkId(input.id);
+      if (!id) throw Object.assign(new Error("id 不合法：要推的那篇没选中，或 id 传错了"), { status: 400 });
+      const article = await store.readArticle(id);
+      if (!article) throw Object.assign(new Error("文章不存在"), { status: 404 });
+      const dryRun = input.dryRun === true;
+      const cfg = await wechatClient.config();
+      if (!dryRun && !cfg.usable) {
+        throw Object.assign(new Error("还没配公众号：在左边对话里让它写一下 AppID 与 AppSecret（存到 ~/.dsh/gzh-studio/wechat.json）"), { status: 400 });
+      }
+
+      const rows = imageChecklist(article);
+      if (!rows.some((row) => row.slot === "cover")) {
+        throw Object.assign(new Error("封面还没出图：公众号图文草稿必须有封面"), { status: 400 });
+      }
+
+      const images = [];
+      for (const row of rows) {
+        const found = store.imagePath(article, row.slot, row.vid);
+        if (!found) throw Object.assign(new Error(`${row.label}：版本 ${row.vid} 的文件不在盘上`), { status: 400 });
+        let bytes = 0;
+        try { bytes = (await stat(found.path)).size; } catch { bytes = 0; }
+        images.push({ slot: row.slot, vid: row.vid, label: row.label, placeholder: row.placeholder, path: found.path, mime: found.mime, bytes });
+      }
+      const svgCount = images.filter((image) => /svg/i.test(image.mime)).length;
+      if (!dryRun && svgCount) {
+        throw Object.assign(new Error(`还有 ${svgCount} 张是占位图（SVG），公众号不认：先出真图再推`), { status: 400 });
+      }
+
+      const title = String(article.title ?? "").trim();
+      const digest = String(article.summary ?? "").trim().slice(0, wechat.LIMITS.digest);
+      const html = renderWechatBody(article).html;
+
+      // 先量一遍再传图：标题/摘要超限、正文明显超长，都不该先把几张图传上去再报错。
+      // 用一条 100 字符的假 URL 占位——真 URL 就这个量级，占位符 12 个字符会低估。
+      const FAKE_IMG_URL = "https://mmbiz.qpic.cn/mmbiz_png/0000000000000000000000000000/0?wx_fmt=png";
+      const preview = wechat.replacePlaceholders(html, Object.fromEntries(images.map((image) => [image.placeholder, FAKE_IMG_URL])));
+      const pre = wechat.checkDraft({ title, digest, content: preview });
+      if (!pre.ok) {
+        const error = Object.assign(new Error(pre.problems.map((problem) => problem.message).join("；")), { status: 400 });
+        error.problems = pre.problems;
+        error.stats = pre.stats;
+        throw error;
+      }
+
+      if (dryRun) {
+        return {
+          dryRun: true, ok: true, problems: [],
+          stats: { ...pre.stats, estimated: true },
+          images, svgCount, limits: wechat.LIMITS, configured: cfg.usable,
+        };
+      }
+
+      const replacements = {};
+      let thumbMediaId = "";
+      for (const image of images) {
+        try {
+          const buffer = await readFile(image.path);
+          if (image.slot === "cover") {
+            const uploaded = await wechatClient.uploadThumb(buffer, { filename: "cover.png", mime: image.mime });
+            thumbMediaId = uploaded.mediaId;
+            if (uploaded.url) replacements[image.placeholder] = uploaded.url;
+          } else {
+            replacements[image.placeholder] = await wechatClient.uploadContentImage(buffer, { filename: `${image.slot}.png`, mime: image.mime });
+          }
+        } catch (error) {
+          // 一步失败要说清是**哪张**：一篇文章五六张图，只回「上传失败」等于没说。
+          throw Object.assign(new Error(`${image.label}（${image.vid}）没传上去：${error?.message ?? error}`), {
+            status: error?.status ?? 502, code: error?.code, ip: error?.ip, hint: error?.hint,
+          });
+        }
+      }
+
+      // 传完再量一次：真 URL 比假 URL 长，刚好卡线时这一遍才发现。
+      const content = wechat.replacePlaceholders(html, replacements);
+      const check = wechat.checkDraft({ title, digest, content });
+      if (!check.ok) {
+        const error = Object.assign(new Error(check.problems.map((problem) => problem.message).join("；")), { status: 400 });
+        error.problems = check.problems;
+        error.stats = check.stats;
+        throw error;
+      }
+
+      const mediaId = await wechatClient.addDraft({ title, author: cfg.author, digest, content, thumbMediaId });
+      // 回执才算推过：不写 lifecycle（那是人标的），只落一条 publish 事件。
+      await store.appendLedger(article.id, {
+        type: "publish", persisted: true, mode: "draft", mediaId,
+        chars: check.stats.contentChars, images: images.length,
+      });
+      return { dryRun: false, ok: true, mediaId, stats: check.stats, images };
+    },
+
+    async remove(input = {}) {
+      const id = checkId(input.id);
+      if (!id) throw Object.assign(new Error("id 不合法"), { status: 400 });
+      const from = join(store.root, "articles", id);
+      const exists = await stat(from).then(() => true, () => false);
+      if (!exists) throw Object.assign(new Error("文章不存在（可能已经删过）"), { status: 404 });
+      const to = join(store.root, "trash", `${id}-${Date.now()}`);
+      await mkdir(dirname(to), { recursive: true });
+      await rename(from, to);
+      return { ok: true, id, trashedTo: to };
+    },
     // 公众号推送：状态 / 配置 / 推一次
-    wechatStatus,
-    saveWechatConfig,
-    pushDraft,
   };
 }
 
@@ -1431,16 +1658,20 @@ export function createService(config, logger = {}) {
  */
 export function apply(ctx, rawConfig) {
   const config = mergeConfig(rawConfig);
-  const service = createService(config, ctx.logger ?? {});
+  const service = createService(config, ctx.logger ?? {}, { llm: ctx.llm });
   const disposers = [];
 
   // 兼容老配置：`settings.json` 里的 `pipelineRoot` 就是「产线根」（真源仓库那一级）。
   // 环境变量优先；两个都没有就不写默认值——市场版绝不去读作者的业务目录。
-  if (!process.env[repo.REPO_ENV]) {
+  // 视频期根目录同理：`episodesRoot` 只是「期放哪」的覆盖值，配了才写进环境。
+  // 两条一起读，避免为了一个字段把 settings.json 解析两次。
+  if (!process.env[repo.REPO_ENV] || !process.env[repo.EPISODES_ENV]) {
     try {
       const stored = JSON.parse(readFileSync(join(service.root, "settings.json"), "utf8"));
       const pipelineRoot = String(stored?.pipelineRoot ?? "").trim();
-      if (pipelineRoot) process.env[repo.REPO_ENV] = pipelineRoot;
+      if (pipelineRoot && !process.env[repo.REPO_ENV]) process.env[repo.REPO_ENV] = pipelineRoot;
+      const episodesRoot = String(stored?.episodesRoot ?? "").trim();
+      if (episodesRoot && !process.env[repo.EPISODES_ENV]) process.env[repo.EPISODES_ENV] = episodesRoot;
     } catch { /* 没有设置文件是正常状态 */ }
   }
 
@@ -1472,7 +1703,13 @@ export function apply(ctx, rawConfig) {
   const addWatch = (dir) => {
     if (!dir) return;
     try {
-      watchers.push(watch(dir, { recursive: true }, () => publishFs()));
+      const watcher = watch(dir, { recursive: true }, () => publishFs());
+      // FSWatcher 的 'error' 没有监听时是未捕获异常（EMFILE 用尽、网络盘 EPERM、
+      // 目录被删/改名都会走到）。监视掉了顶多退回手动刷新，不该让宿主进程跟着倒。
+      watcher.on("error", (error) => {
+        ctx.logger?.warn?.(`gzh-studio: 监视 ${dir} 出错（${error?.code ?? error?.message ?? error}），已退回手动刷新`);
+      });
+      watchers.push(watcher);
     } catch { /* 目录不存在 / 平台不支持递归监视：退回手动刷新，不影响别的功能 */ }
   };
 
@@ -1638,6 +1875,8 @@ export function apply(ctx, rawConfig) {
   routeGet(ROUTES.repo, async () => json(await service.repoScan()));
   routeGet(ROUTES.repoArticle, async (query) => json(await service.repoArticle(query.get("dir") ?? "")));
   routeGet(ROUTES.video, async () => json(await service.videoScan()));
+  // 视频目录空态上的两个按钮：指到已有目录（path）/ 建出约定目录（create）
+  routePost(ROUTES.videoSetup, async (input) => json(await service.setupVideo(input)));
   routeGet(ROUTES.videoEpisode, async (query) => json(await service.videoEpisode(query.get("id") ?? "")));
   // 媒体文件：支持 Range（`<video>` 拖进度条靠它）。不整文件读进内存，走流。
   routeGet(ROUTES.media, async (query, request) => {
@@ -1681,13 +1920,12 @@ export function apply(ctx, rawConfig) {
     });
   });
   routeGet(ROUTES.gate, async (query) => json(await service.gateOf(query.get("dir") ?? "")));
-
-  // ── 推草稿 ─────────────────────────────────────────────────────────────────
-  // status 只是一次读盘（配置 + 缓存），配置写入才落盘；
-  // push 走 POST（apply 里统一推实时事件，面板不用等下一次手刷）。
+  // 删一篇（移到 ~/.dsh/gzh-studio/trash/，可手动搬回）
+  routePost(ROUTES.remove, async (input) => json(await service.remove(input)));
+  // 公众号草稿箱：状态 + 真推一次（不发表，只进草稿箱）
   routeGet(ROUTES.wechatStatus, async () => json(await service.wechatStatus()));
-  routePost(ROUTES.wechatConfig, async (body) => json(await service.saveWechatConfig(body)));
-  routePost(ROUTES.push, async (body) => json(await service.pushDraft(body)));
+  routePost(ROUTES.push, async (input) => json(await service.pushDraft(input)));
+
 
   // 监视两个「会被人 / agent 从外面写」的目录：工作台自己的文章库，和视频期目录。
   // 面板内的写有 POST 事件兜着，这两个 watch 负责看不见的那部分（agent 直接落文件）。
@@ -1696,7 +1934,9 @@ export function apply(ctx, rawConfig) {
   addWatch(join(service.root, "articles"));
   // 视频期目录只在配了真源仓库时才监视：没配就 watch 一个相对路径，
   // 会变成「静默监视当前工作目录」，比不监视更糟。
-  if (repo.repoConfigured()) addWatch(join(repo.repoRoot(), "07-video", "episode"));
+  // 监视的是**实际在读的那个期目录**（可能是 episodesRoot 配过的位置），不是约定值：
+  // 监视约定值而面板读别处，就等于「agent 新建了一期，看板不会自己刷新」。
+  if (repo.repoConfigured()) addWatch(repo.episodesRoot());
 
   ctx.effect(
     () => async () => {

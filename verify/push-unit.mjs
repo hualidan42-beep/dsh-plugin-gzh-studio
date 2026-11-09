@@ -123,18 +123,18 @@ assert.ok(articlePayload.content.includes("https://mmbiz.qpic.cn/cover/1.png"), 
 assert.ok(articlePayload.content.includes("https://mmbiz.qpic.cn/body/"), "正文图 URL 进正文");
 assert.ok(!/__IMG_\d+__|__IMG_COVER__/.test(articlePayload.content), "占位符必须全部换掉");
 
-// ── 4. 回执：账本 + 生命周期（按回执推断，不是人手标）────────────────────────
+// ── 4. 回执：账本里落一条 publish（不自动改生命周期）──────────────────────────
 const ledger = await store.readLedger(created.article.id, 50);
 const pushEvent = ledger.find((row) => row.type === "publish");
 assert.ok(pushEvent, "账本里要有 publish 回执");
 assert.equal(pushEvent.persisted, true, "真推过的回执才作数");
 assert.equal(pushEvent.mediaId, "DRAFT-1");
-const receipts = await store.idsWithDraftReceipt();
-assert.ok(receipts.has(created.article.id), "回执要被识别出来");
-const listed = await store.listArticles({ draftPushed: receipts });
-const listedRow = (Array.isArray(listed) ? listed : []).find((item) => item.id === created.article.id);
-assert.equal(listedRow?.lifecycle?.value, "draftbox", "生命周期按回执推到草稿箱");
-assert.equal(listedRow?.lifecycle?.source, "inferred", "来源必须是「推断」，不能冒充人手标");
+// 0.4.x 删掉了 `idsWithDraftReceipt()` 与「草稿箱」这一档：推成功只落回执，
+// **不自动改生命周期**——「这篇算写完了没有」是人的判断，机器不替人标。
+const afterPush = await store.listArticles();
+const afterRow = (Array.isArray(afterPush) ? afterPush : []).find((item) => item.id === created.article.id);
+assert.notEqual(afterRow?.lifecycle?.value, "draftbox", "不该再出现「草稿箱」这个推断出来的档位");
+assert.notEqual(afterRow?.lifecycle?.source, "inferred", "推草稿不该推出一个人手标或推断状态");
 
 // ── 5. 限额：超标题在本地拦下，不打网络 ───────────────────────────────────────
 const longTitle = await service.create({ title: "长".repeat(40), sections: 1, template: "business" });

@@ -169,7 +169,18 @@ const NODES = [{ id: "fake", name: "占位图（不联网）", fake: true, usabl
 {
   const tree = mod.PhonePreview({ article: ARTICLE, templates: TEMPLATES, selected: "sec-s1", onSelect: () => {} });
   const joined = texts(tree).join(" | ");
-  assert.ok(joined.includes("375px"), "顶栏标了 375px");
+  // 375 是**预览容器的真实宽度**（`.gzs-phone` 的 width），不是屏上那行字。
+  // 那行「375px · 微信正文预览」已经删掉：工程参数不该印进读者画面（见 client.js 里
+  // `.gzs-phone` 的注释）。所以这里断言的是容器宽度契约，不是文案。
+  const phone = collect(tree, (n) => cls(n).includes("gzs-phone"))[0];
+  assert.ok(phone, "有手机预览容器");
+  // 375 是**预览容器的真实宽度**（`.gzs-phone{width:${PHONE_WIDTH}px}`，PHONE_WIDTH=375），
+  // 不是屏上那行字：那行「375px · 微信正文预览」已经删掉（工程参数不该印进读者画面）。
+  const clientSrc = await import("node:fs/promises")
+    .then((fs) => fs.readFile(new URL("../client.js", import.meta.url), "utf8"));
+  assert.ok(/const PHONE_WIDTH = 375\b/.test(clientSrc), "真机宽度常量是 375");
+  assert.ok(/\.gzs-phone\{width:\$\{PHONE_WIDTH\}px/.test(clientSrc),
+    "手机预览宽度取自 PHONE_WIDTH（跟着常量走，不能被压窄）");
   assert.ok(joined.includes("一家药企把审批"), "渲染标题");
   assert.ok(joined.includes("两个坑"), "渲染副标题");
   assert.ok(joined.includes("坑一：以为流程是画出来的"), "渲染小标题");
@@ -261,13 +272,19 @@ const props = (selected) => ({
 {
   const tree = mod.Inspector(props("cover"));
   const joined = texts(tree).join(" | ");
-  assert.ok(joined.includes("封面（900×383）"), "标题写明槽位与尺寸");
+  // 顶部「当前工作上下文」（0.4.6 起对齐历史工作台）：定位、期号、卡点都要看得见
+  assert.ok(joined.includes("当前工作上下文"), "右栏顶上有上下文卡");
+  assert.ok(joined.includes("封面（900×383）"), "上下文卡写明槽位与尺寸");
+  assert.ok(joined.includes("未绑期号"), "没绑期号时明说，不留空");
   assert.ok(joined.includes("v002"), "显示当前版本");
-  // prompt 必须来自落盘字段（这是「提示词不再一次性」的判据）
-  const inputs = collect(tree, (n) => n.type === "input" || n.type === "textarea");
-  const promptInput = inputs.find((n) => String(n.props.placeholder ?? "").includes("主体 + 场景"));
-  assert.ok(promptInput, "有 prompt 输入框");
-  assert.equal(promptInput.props.value, "晨光下的工厂车间", "prompt 从 article.cover.prompt 读出来");
+  // 右栏是**只读看板**：prompt 由 ro() 渲染成文字，不再是输入框。
+  // 判据从「有 input」改成「有这段文字 + 有让 Agent 改的入口」，
+  // 验证意图不变：prompt 来自落盘字段，不是一次性输入。
+  assert.equal(collect(tree, (n) => n.type === "input" || n.type === "textarea").length, 0,
+    "右栏不出输入框（看板口径）");
+  // 0.4.5 起 prompt 收进「图」页底部的折叠区（默认收起），所以首屏看不到它——
+  // 这正是不想让人一打开「图」就撞见生成控件。这里断言折叠区的入口在。
+  assert.ok(joined.includes("换一张") || joined.includes("出一张"), "图页底部有出图折叠入口");
   // 版本条：两版，当前版带「当前」
   const vers = collect(tree, (n) => /(^| )gzs-ver( |$)/.test(cls(n)));
   assert.equal(vers.length, 2, "两个版本都在");
@@ -279,12 +296,44 @@ const props = (selected) => ({
   // 出图按钮在
   const buttons = collect(tree, (n) => n.type === "button");
   assert.ok(buttons.some((b) => texts(b).join("").includes("出图")), "有出图按钮");
-  // 只显示本槽位的 QA（封面那条），不串段
-  const qaRows = collect(tree, (n) => /(^| )gzs-qa( |$)/.test(cls(n)));
-  assert.equal(qaRows.length, 1, "封面只看到封面那条检查");
-  assert.ok(texts(qaRows[0]).join("").includes("封面比例不对"), "封面那条是比例问题");
-  // 账本按槽位过滤
-  assert.ok(joined.includes("太干净了"), "反馈原话在账本里");
+
+  // ── 三个页签（2026-11-09 用户定稿）────────────────────────────────────────
+  //   `第 N 段（整篇 / 封面）` / `图 N` / `版式`
+  // 「证据」「事件」两页已按用户要求删掉；它们的内容（质量检查 / 十道门 / 账本）
+  // 仍在「检查」（治理）抽屉里，所以右栏不再重复一遍。
+  const panels = collect(tree, (n) => /gzs-itabpanel/.test(cls(n)));
+  assert.equal(panels.length, 3, "三个页签面板都在");
+  const tabTexts = collect(tree, (n) => /(^| )gzs-itab( |$)/.test(cls(n))).map((n) => texts(n).join(""));
+  assert.equal(tabTexts.length, 3, "三个页签");
+  assert.equal(tabTexts[0], "封面", "第一个页签是具体定位（封面/第 N 段/整篇），不是固定词");
+  assert.deepEqual(tabTexts.slice(1), ["图2", "版式"],
+    `后两个页签要叫 图/版式，实际 ${JSON.stringify(tabTexts)}`);
+  assert.ok(!tabTexts.some((t) => /元信息|证据|事件/.test(t)),
+    `不该再有「元信息 / 证据 / 事件」页签，实际 ${JSON.stringify(tabTexts)}`);
+
+  // 按内容找面板，不按序号——页签顺序以后还可能调
+  const imagesPanel = panels.find((p) => JSON.stringify(p).includes("gzs-gallery"));
+  assert.ok(imagesPanel, "「图」页签里有缩略图行");
+  assert.ok(JSON.stringify(imagesPanel).includes("gzs-bigpic"), "「图」页签有大图");
+  assert.ok(JSON.stringify(imagesPanel).includes("gzs-lines2"), "「图」页签有规格行");
+  assert.ok(JSON.stringify(imagesPanel).includes("gzs-collapse"), "出图控件在图页的折叠区里");
+  assert.equal(
+    collect(imagesPanel, (n) => n.type === "button" && texts(n).join("").trim() === "出图").length,
+    0,
+    "「图」页签首屏不该出现「出图」按钮（它收在折叠区里）",
+  );
+  // 折叠着 = 首屏看不到 prompt：这正是「打开图页只见图」的意思
+  assert.ok(!texts(imagesPanel).join(" ").includes("晨光下的工厂车间"),
+    "prompt 在折叠区里，图页首屏不显示");
+  // 版式页：模板规格 + 导出记录
+  const layoutPanel = panels.find((p) => texts(p).join(" ").includes("正文字号"));
+  assert.ok(layoutPanel, "「版式」页签有正文规格");
+  assert.ok(texts(layoutPanel).join(" ").includes("模板"), "「版式」里有排版模板");
+  // 质量检查那一条现在只在「检查」抽屉里出现；右栏不再重复（见上面的页签断言）
+  assert.equal(collect(tree, (n) => /(^| )gzs-qa( |$)/.test(cls(n))).length, 0,
+    "右栏不再渲染质量检查条目");
+  // 账本同理：右栏没有「事件」页了
+  assert.ok(!joined.includes("太干净了"), "账本不在右栏（在「检查」抽屉里）");
 }
 
 // 段落槽位
@@ -292,16 +341,17 @@ const props = (selected) => ({
   const tree = mod.Inspector(props("sec-s1"));
   const joined = texts(tree).join(" | ");
   assert.ok(joined.includes("第 1 段配图"), "段号正确");
-  const inputs = collect(tree, (n) => n.type === "input");
-  const heading = inputs.find((n) => n.props.placeholder === "这一段讲什么");
-  assert.ok(heading, "有段落小标题输入框");
-  assert.equal(heading.props.value, "坑一：以为流程是画出来的", "小标题从载荷读");
-  const areas = collect(tree, (n) => n.type === "textarea");
-  assert.ok(areas.length >= 1, "正文是 textarea");
-  assert.ok(String(areas[0].props.value).includes("流程不是画出来的"), "正文从载荷读");
+  // 「本段」页：0.4.6 起默认停在这里，直接给这一段的小标题与原文（照历史工作台）
+  assert.ok(joined.includes("坑一：以为流程是画出来的"), "本段页显示小标题");
+  assert.ok(joined.includes("本节原文"), "本段页有「本节原文」");
+  assert.ok(joined.includes("流程不是画出来的"), "原文照抄在引文块里");
+  assert.ok(joined.includes("意见锚点"), "写明意见锚在哪");
+  // 仍然是看板：小标题/正文不是输入框
+  assert.equal(collect(tree, (n) => /gzs-quote/.test(cls(n))).length, 1, "原文用引文块，不是 textarea");
   assert.ok(joined.includes("删掉这一段"), "有删段入口");
-  assert.equal(collect(tree, (n) => /gzs-qa/.test(cls(n))).length, 0, "这一段没有检查项 → 显示「没有问题」");
-  assert.ok(joined.includes("这项暂时没有问题"), "没有检查项时也说话");
+  // 质量检查已不在右栏（只在「检查」抽屉里）
+  assert.equal(collect(tree, (n) => /gzs-qa/.test(cls(n))).length, 0,
+    "右栏不再渲染质量检查条目");
 }
 
 // 整篇
@@ -309,15 +359,13 @@ const props = (selected) => ({
   const tree = mod.Inspector(props("article"));
   const joined = texts(tree).join(" | ");
   assert.ok(joined.includes("整篇"), "标题是整篇");
-  assert.ok(joined.includes("1 个必改"), "顶栏徽章报必改数");
-  const selects = collect(tree, (n) => n.type === "select");
-  assert.ok(selects.length >= 1, "有模板下拉");
-  assert.equal(selects[0].props.value, "business", "当前模板");
-  const options = collect(selects[0], (n) => n.type === "option");
-  assert.equal(options.length, 2, "两套模板选项");
-  const qaRows = collect(tree, (n) => /(^| )gzs-qa( |$)/.test(cls(n)));
-  assert.equal(qaRows.length, 3, "整篇看到全部三条检查");
-  assert.ok(joined.includes("改法："), "每条检查都写改法");
+  assert.ok(joined.includes("1 个必改"), "上下文卡报必改数");
+  // 排版模板：0.4.x 起也是只读行 + 「让 Agent 改」，不是下拉框
+  assert.equal(collect(tree, (n) => n.type === "select").length, 0, "右栏不再有模板下拉（看板口径）");
+  assert.ok(joined.includes("排版模板"), "有排版模板这一行");
+  // 质量检查条目已移出右栏（只在「检查」抽屉里）；「必改数」仍由上下文卡报出
+  assert.equal(collect(tree, (n) => /(^| )gzs-qa( |$)/.test(cls(n))).length, 0,
+    "右栏不再渲染质量检查条目");
 }
 
 // 整篇 · 提案区（改稿先看对照，确认后才写）
@@ -412,14 +460,16 @@ const PROPOSALS = [
   assert.ok(blocked.includes("正文在提案之后被改过"), "拦住时显示原因");
   assert.ok(!blocked.includes("gzs-diff"), "拦住时不画对照");
 
-  // 赛道口径：元信息里要说清「按哪套口径写」，并交代规则条数
+  // 赛道口径：右栏要能看出「这一篇按哪套口径写」。
+  // 「内容类型口径」那一块（规则条数）随「证据」页一起移到了「检查」抽屉，
+  // 右栏只在「整篇」和上下文卡里保留**类型名**——先知道是什么口径，细节去抽屉里看。
   const tracked = texts(mod.Inspector({
     ...props("article"),
     proposals: [],
     track: { id: "medical", name: "医疗健康", tierLabel: "强合规", tone: "克制、给依据", structure: ["场景", "证据", "边界"], rules: { forbidden: 9, required: 1 } },
   })).join(" | ");
-  assert.ok(tracked.includes("内容类型口径") && tracked.includes("医疗健康"), "元信息里要显示内容类型");
-  assert.ok(tracked.includes("禁用词 9 条"), "要交代规则条数（不然用户不知道这套口径管什么）");
+  assert.ok(tracked.includes("医疗健康"), "右栏要显示内容类型名");
+  assert.ok(tracked.includes("内容类型"), "「整篇」里有内容类型这一行");
   const noTrack = texts(mod.Inspector({ ...props("article"), proposals: [] })).join(" | ");
   // 赛道是可选的：没选的时候不能像「缺了一步」，要说清「通用也能用」
   assert.ok(noTrack.includes("通用模式"), "没选赛道要说明通用模式照常可用");
@@ -432,73 +482,7 @@ const PROPOSALS = [
   assert.doesNotThrow(() => mod.Inspector({ article: ARTICLE, selected: "cover" }), "缺 qa/ledger/nodes 也能渲染");
 }
 
-// ── 发布包：一稿多投 ────────────────────────────────────────────────────────
-{
-  const xhs = mod.platformPack(ARTICLE, "xhs");
-  assert.equal(xhs.spec.name, "小红书", "按平台取档案");
-  assert.ok(xhs.checks.some((c) => c.id === "cover"), "3:4 平台遇到 2.35:1 封面要提醒裁切");
-
-  const longArticle = { ...ARTICLE, title: "这是一条很长很长很长很长很长很长很长很长很长的标题肯定超过二十个字了" };
-  const longPack = mod.platformPack(longArticle, "xhs");
-  assert.equal(longPack.titleCut, true, "超 20 字要截断");
-  assert.ok(longPack.title.length <= 20, "截到上限内");
-  assert.ok(longPack.checks.some((c) => c.id === "title"), "超标题要提醒");
-
-  const linkPack = mod.platformPack(
-    { ...ARTICLE, sections: [{ id: "s1", heading: "参考", body: "详见 https://example.com/a" }] },
-    "douyin",
-  );
-  assert.ok(linkPack.checks.some((c) => c.id === "link"), "不能点外链的平台要提醒");
-
-  assert.equal(mod.platformPack(ARTICLE, "wechat").spec.publish, "draft", "只有公众号能直推草稿");
-  assert.equal(mod.platformPack(ARTICLE, "xhs").spec.publish, "package", "小红书只能出包");
-
-  const dialogText = texts(mod.PublishPackDialog({ article: ARTICLE, onPush: () => {} })).join(" | ");
-  ["公众号", "小红书", "抖音", "快手"].forEach((name) => {
-    assert.ok(dialogText.includes(name), `发布包要列出「${name}」`);
-  });
-  assert.ok(dialogText.includes("复制标题+正文"), "每个平台都要能复制");
-  assert.ok(dialogText.includes("去推草稿"), "公众号那行能直接跳推草稿");
-  assert.ok(dialogText.includes("不是「一键发布」"), "要说清只有公众号能真推");
-  assert.ok(!dialogText.includes("undefined"), "缺字段不能漏到界面上");
-  assert.doesNotThrow(() => mod.PublishPackDialog({ article: null }), "空文章不崩");
-
-  // 存过的平台版本优先于原稿
-  const withTargets = {
-    ...ARTICLE,
-    targets: [{ platform: "xhs", title: "小红书版标题", body: "小红书版正文", hashtags: ["AI", "效率"] }],
-  };
-  const savedPack = mod.platformPack(withTargets, "xhs");
-  assert.equal(savedPack.saved, true, "要标出这行用的是已存版本");
-  assert.equal(savedPack.title, "小红书版标题", "已存标题覆盖原稿");
-  assert.ok(savedPack.copyText.includes("小红书版正文"), "已存正文覆盖原稿");
-  assert.ok(savedPack.copyText.includes("#AI #效率"), "话题跟着复制走");
-
-  // 只存差异：和原稿一样的不落盘（否则一份正文会变成四五份）
-  const diff = mod.targetsFromDraft(ARTICLE, {
-    xhs: { title: "短标题", body: "", hashtags: "AI 效率" },
-    wechat: { title: ARTICLE.title, body: "", hashtags: "" },
-    douyin: { title: "", body: "", hashtags: "" },
-  });
-  assert.deepEqual(diff, [{ platform: "xhs", title: "短标题", hashtags: ["AI", "效率"] }], "只存和原稿不同的部分");
-
-  const savedDialog = mod.PublishPackDialog({ article: withTargets, onPush: () => {}, onSave: () => {} });
-  const inputs = collect(savedDialog, (n) => n.type === "input");
-  assert.ok(inputs.some((n) => n.props.value === "小红书版标题"), "已存版本要回填到输入框");
-  assert.ok(texts(savedDialog).join(" ").includes("保存平台版本"), "要有保存按钮");
-  assert.ok(texts(savedDialog).join(" ").includes("已存平台版"), "要标出这一行已经存过");
-
-  // 脏数据不能让面板崩（历史文件里 targets 可能是对象 / 字符串）
-  assert.doesNotThrow(() => mod.platformPack({ ...ARTICLE, targets: "xhs" }, "xhs"), "targets 不是数组也不崩");
-  assert.equal(mod.platformPack({ ...ARTICLE, targets: { xhs: {} } }, "xhs").saved, false, "非数组等于没存过");
-  assert.deepEqual(mod.targetsFromDraft(ARTICLE, null), [], "空草稿＝清空");
-  assert.equal(
-    mod.targetsFromDraft({ ...ARTICLE, title: "T" }, { douyin: { title: 123, hashtags: 5 } }).length,
-    1,
-    "数字也能转成文本，不抛错",
-  );
-}
-
+// 发布包（一稿多投）：0.4.x 移除了「一稿多投」发布包（platformPack / PublishPackDialog / targetsFromDraft 都已不在模块里）
 // ── 主题跟随宿主 ────────────────────────────────────────────────────────────
 {
   assert.deepEqual(mod.parseCssColor("#338"), [51, 51, 136], "短 hex 也要能解析");
@@ -603,33 +587,7 @@ const PROPOSALS = [
   }
 }
 
-// ── 新建表单 ─────────────────────────────────────────────────────────────────
-{
-  const tree = mod.NewArticle({ templates: TEMPLATES, onCreate: () => {}, onCancel: () => {}, busy: false });
-  const joined = texts(tree).join(" | ");
-  assert.ok(joined.includes("新建一篇"), "标题");
-  assert.ok(joined.includes("讲给谁"), "问受众");
-  assert.ok(joined.includes("想让人带走什么"), "问带走什么");
-  assert.ok(joined.includes("先摆几段"), "问段数");
-  assert.equal(collect(tree, (n) => n.type === "input").length >= 4, true, "四个输入位（标题/受众/带走/段数）");
-  assert.doesNotThrow(() => mod.NewArticle({ templates: [], onCreate: () => {}, onCancel: () => {}, busy: true }), "没有模板也能开");
-
-  // 赛道：新建时就要能选（不选也行，之后在顶栏补）
-  const tracked = mod.NewArticle({
-    templates: TEMPLATES,
-    tracks: [
-      { id: "medical", name: "医疗健康", tierLabel: "强合规", tone: "克制、给依据", defaultTemplate: "business" },
-      { id: "pet-care", name: "宠物养护", tierLabel: "生活通用", custom: true },
-    ],
-    onCreate: () => {}, onCancel: () => {}, busy: false,
-  });
-  const trackedText = texts(tracked).join(" | ");
-  assert.ok(trackedText.includes("内容类型"), "新建表单要有内容类型选择");
-  assert.ok(trackedText.includes("医疗健康") && trackedText.includes("宠物养护"), "赛道选项来自下发列表");
-  assert.ok(trackedText.includes("自定义"), "自定义赛道要标出来");
-  assert.doesNotThrow(() => mod.NewArticle({ templates: [], tracks: undefined, onCreate: () => {}, onCancel: () => {} }), "没有赛道列表也能开");
-}
-
+// 新建表单：新建表单不再由客户端渲染（NewArticle 已移除），新建走对话
 // ── 工具函数 ─────────────────────────────────────────────────────────────────
 {
   assert.equal(mod.countWords("一二三 4五"), 5, "字数不算空白");
@@ -760,12 +718,16 @@ const PROPOSALS = [
   const filteredText = texts(filteredEmpty).join(" | ");
   assert.ok(filteredText.includes("没有匹配的稿"), "筛没了要说「没有匹配」，不是「还没有文章」");
   assert.ok(filteredText.includes("库里共 3 篇"), "要报分母，才不像库被清空");
-  assert.ok(!filteredText.includes("三步开始"), "筛没了不该出现首启向导");
+  assert.ok(!filteredText.includes("说一句话，它帮你从选题写到成稿"), "筛没了不该出现首启页");
   const emptyLibrary = mod.Home({
     list: [], root: "", onOpen: () => {}, onCreate: () => {},
     counts: { ...COUNTS, total: 0 }, filters: { state: "all", q: "" }, matched: 0,
   });
-  assert.ok(texts(emptyLibrary).join(" ").includes("三步开始"), "真空库才给首启向导");
+  // 首启页 0.4.x 改过口径：不再教「三步配置」，只给一句话 + 一个入口（见 `Welcome` 注释）。
+  // 所以断言从「三步开始」改成「首启那句话 + 开始写」。
+  const emptyText = texts(emptyLibrary).join(" ");
+  assert.ok(emptyText.includes("说一句话，它帮你从选题写到成稿"), "真空库才给首启页");
+  assert.ok(emptyText.includes("开始写"), "首启页给「开始写」这个入口");
 
   // 「现在可以做这些」：首屏先给待办，点一条直接进那一篇（不用先筛选再找）
   const queueOpenedIds = [];
@@ -782,14 +744,16 @@ const PROPOSALS = [
     onCreate: () => {},
   });
   const queueText = texts(queue).join(" | ");
-  assert.ok(queueText.includes("在草稿箱等发布"), "草稿箱待发要出现");
+  // 0.4.x 里去掉了「草稿箱」这一档（生命周期只剩 draft / published），
+  // 所以「在草稿箱等发布」这张卡不存在了；现在的三格是：配图没齐 / 空壳 / 接着上次改。
   assert.ok(queueText.includes("配图没齐"), "配图没齐要出现（数来自 list，不额外请求）");
+  assert.ok(queueText.includes("空壳"), "空壳那一格要出现");
   assert.ok(queueText.includes("接着上次改"), "最近在改的也要出现");
   const queueCards = collect(queue, (n) => /(^| )gzs-today__card( |$)/.test(cls(n)));
   queueCards[0].props.onClick({});
-  assert.deepEqual(queueFilters[0], { state: "draftbox" }, "点草稿箱卡片去筛选");
+  assert.equal(queueOpenedIds[0], "gzh-a", "点缺图卡片直接打开那一篇（不再跳去筛选）");
   queueCards[1].props.onClick({});
-  assert.equal(queueOpenedIds[0], "gzh-a", "点缺图卡片直接打开那一篇");
+  assert.equal(queueOpenedIds[1], "gzh-b", "点空壳卡片打开那一篇接着写");
   assert.equal(mod.TodayQueue({ list: [], counts: { byState: {} }, activity: [] }), null, "没事可做就不占位置");
 
   const txt = texts(tree).join(" | ");
@@ -801,7 +765,10 @@ const PROPOSALS = [
   assert.ok(txt.includes("7 篇"), `头部总数取 counts.total 而不是卡片数，实际「${(txt.match(/\d+ 篇/) ?? [""])[0]}」`);
   assert.ok(!txt.includes("2 篇 · 封面"), "不能把筛出的 2 篇当总数");
   // 计数条上四档都要在，且数字来自 counts
-  assert.ok(txt.includes("草稿") && txt.includes("草稿箱") && txt.includes("已发布"), "计数条列出三档状态");
+  // 计数条：0.4.x 起生命周期只剩「草稿 / 已发布」两档（草稿箱那一档随推草稿一起删了），
+  // 再加「全部」和一个空壳计数。断言按现状的三格 + 空壳写。
+  assert.ok(txt.includes("全部") && txt.includes("草稿") && txt.includes("已发布"), "计数条列出全部 / 草稿 / 已发布");
+  assert.ok(!txt.includes("草稿箱"), "草稿箱那一档已经删掉，不该再出现在计数条上");
 
   // 筛选提示要把**四个维度都算上**：只看 q 与 state 会漏掉标签和月份，
   // 点了标签却显示「1 篇 · 封面、正文…」，看着像总数变小而不是被筛出来的。
@@ -1015,16 +982,14 @@ const PROPOSALS = [
   assert.ok(unboundText.includes("粗略估计"), "未绑定要标明是估的，不假装精确");
   assert.ok(unboundText.includes("有标题") && unboundText.includes("有正文"), "未绑定给五档粗略进度");
   assert.ok(/完成 2\/5 档/.test(unboundText), `算出完成了几档，实际「${(unboundText.match(/完成 \d+\/\d+ 档/) ?? [""])[0]}」`);
-  assert.ok(unboundText.includes("接上产线"), "进阶入口在，但要点开才出现");
-  assert.ok(!unboundText.includes("期号（如"), "期号输入默认收起，不挡路");
+  // 2026-11-08 起「接上产线」那张表整块删掉了：它要用户填期号 + 绝对路径两个黑话字段。
+  // 现在挂期号由 Agent 在对话里做，面板只留一句「要精确结论就让 Agent 去绑」。
+  assert.ok(unboundText.includes("让 Agent 去绑"), "说清绑期号改由 Agent 做，面板不再给表单");
+  assert.ok(!unboundText.includes("期号（如"), "期号输入已经删掉，不该再出现");
   assert.ok(!unboundText.includes("下一步"), "未绑定不能编出一个精确的下一步");
 
-  // 点开进阶才出现期号与根目录
-  const adv = mod.PipeBlock({
-    pipeline: { bound: false }, busy: false, root: "", onRefresh: () => {}, onBind: () => {},
-    articleTitle: "", hasBody: false, hasCover: false, imageGaps: 0, roughProgress: {},
-  });
-  assert.ok(texts(adv).join(" ").includes("接上产线"), "有进阶按钮");
+  // 未绑定也不该再渲染任何输入控件（那块表单已删）
+  assert.equal(collect(unbound, (n) => n.type === "input").length, 0, "未绑定态不出输入框");
 
   const BOUND = {
     bound: true, episodeId: "historical-person-026", episodeNo: 26,
@@ -1277,7 +1242,9 @@ const PROPOSALS = [
     reviews: { done: 0, total: 16 }, deai: null, feedback: null,
   };
 
-  // 左栏：未绑期号 → 11 步 + 如实标注 + 绑定入口；结构列表收在底部但还在
+  // 左栏：未绑期号 → 11 步 + 如实标注；「接上产线」那颗按钮 2026-11-08 已删
+  // （它后面是要人填期号与绝对路径的表，挂期号改由 Agent 在对话里做），
+  // 现在只留一句「按稿件推断 · 未绑定期号」把口径说清。
   const rail = mod.StepRail({
     view, article: ARTICLE, selected: "sec-s1",
     onSelect: () => {}, onAddSection: () => {}, onBind: () => {}, busy: false, root: "",
@@ -1286,7 +1253,7 @@ const PROPOSALS = [
   const stepRows = collect(rail, (n) => /(^| )gzs-stepline( |$)/.test(cls(n)));
   assert.equal(stepRows.length, 11, "未绑期号也列满 11 步");
   assert.ok(railText.includes("按稿件推断 · 未绑定期号"), "如实标注「按稿件推断 · 未绑定期号」");
-  assert.ok(railText.includes("接上产线"), "给绑定入口");
+  assert.ok(!railText.includes("接上产线"), "绑定表单已删，左栏不该再有「接上产线」");
   assert.ok(railText.includes("结构"), "结构小节还在");
   assert.equal(collect(rail, (n) => /(^| )gzs-item( |$)/.test(cls(n))).length, 3, "结构列表收在底部，照样 3 行");
   // 三重编码：每一行都同时有「点 + 文字」，不能只靠颜色
@@ -1317,7 +1284,11 @@ const PROPOSALS = [
   assert.ok(stageText.includes("流程不是画出来的"), "成稿有正文");
   // 2026-11-02 用户指令：中栏只留「成稿 / 手机预览」，排版视图去掉（导出入口进了手机预览上方工具条）
   ["成稿", "手机预览"].forEach((label) => assert.ok(stageText.includes(label), `视图切换里有「${label}」`));
-  assert.ok(!stageText.includes("排版件"), "不再有「排版件」这个视图");
+  // 「排版件」这四个字现在只作为**导出状态**出现（`排版件 <sha>` / `还没有排版件`），
+  // 不再是一个视图。所以断言改成：视图切换里没有「排版」这一颗。
+  const stageButtons = collect(stage, (n) => n.type === "button").map((b) => texts(b).join("").trim());
+  assert.ok(!stageButtons.includes("排版事项") && !stageButtons.includes("排版"),
+    `视图切换里不该再有「排版」，实际 ${JSON.stringify(stageButtons.slice(0, 8))}`);
   assert.equal(collect(stage, (n) => cls(n).includes("gzs-doch")).length, 2, "两个节标题");
   const stageImgs = collect(stage, (n) => n.type === "img");
   assert.equal(stageImgs.length, 2, "封面 + 第一段图按节内联");
@@ -1326,81 +1297,34 @@ const PROPOSALS = [
   assert.equal(collect(stage, (n) => /(^| )gzs-phone( |$)/.test(cls(n))).length, 0, "默认是成稿，不是手机预览");
   const metaText = collect(stage, (n) => /(^| )gzs-meta( |$)/.test(cls(n))).map((n) => texts(n).join(" ")).join(" ");
   ["字", "节", "图", "模板", "受众", "更新"].forEach((k) => assert.ok(metaText.includes(k), `元信息行里有「${k}」`));
-  // 排版视图：导出入口 + 口径说明
-  // 2026-11-02：排版视图去掉，导出入口挪进手机预览上方的工具条
-  const bar = mod.ExportBar({ article: ARTICLE, onExport: () => {} });
-  const barText = texts(bar).join(" ");
-  assert.ok(barText.includes("导出 HTML"), "导出工具条给「导出 HTML」");
-  assert.ok(barText.includes("Markdown") && barText.includes("图片清单"), "三条导出入口都在");
-  assert.equal(texts(mod.ExportBar({ article: null })).length, 0, "空载荷不渲染");
-  assert.ok(texts(mod.Manuscript({ article: null })).join("").includes("还没有选中文章"), "空载荷不崩");
-
-  // 推草稿对话框：没配公众号时它必须是「配置向导」，不能只写一句「未配置」
-  const pushDlg = mod.PushDialog({ id: "gzh-20261104-0001", onClose: () => {}, onDone: () => {} });
-  const pushText = texts(pushDlg).join(" ");
-  assert.ok(pushText.includes("推草稿"), "对话框标题");
-  assert.ok(pushText.includes("AppID") && pushText.includes("AppSecret"), "配置向导要给 AppID / AppSecret 两个入口");
-  assert.ok(pushText.includes("IP 白名单"), "40164 的下一步要直接写在界面上");
-  assert.ok(pushText.includes("草稿") && pushText.includes("不是「发布」"), "不许把推草稿说成发布");
-  assert.doesNotThrow(() => mod.PushDialog({}), "缺 props 不崩");
-
-  // 「上次推过」提示：推草稿是新建不是覆盖，连点两次会有两条草稿
-  const notice = mod.LastPublishNotice({ lastPublish: { ts: Date.now() - 120000, mediaId: "DRAFT-1" } });
-  const noticeText = texts(notice).join(" ");
-  assert.ok(noticeText.includes("上次推过") && noticeText.includes("DRAFT-1"), "要给出上一次回执");
-  assert.ok(noticeText.includes("不会覆盖"), "要说清再推会多一条");
-  assert.equal(mod.LastPublishNotice({ lastPublish: null }), null, "没推过就什么都不显示");
-
-  // 首启向导：空库时给的是「三步怎么开始」，不是库存 0 篇
-  const firstRun = mod.FirstRun({ onCreate: () => {}, onConfigureNodes: () => {}, onConfigureWechat: () => {} });
-  const firstText = texts(firstRun).join(" ");
-  assert.ok(firstText.includes("三步开始"), "首启要有明确的三步");
-  assert.ok(firstText.includes("可跳过") && firstText.includes("可选"), "第 2、3 步要写明可跳过（否则像强制配置）");
-  assert.ok(firstText.includes("AppID"), "公众号那步要提到 AppID");
-  assert.doesNotThrow(() => mod.FirstRun({}), "首启缺 props 不崩");
-
-  // 出图节点配置：key 只填环境变量名，界面上不许出现密钥输入
-  const nodeDlg = mod.NodeDialog({ onClose: () => {}, onSaved: () => {} });
-  const nodeText = texts(nodeDlg).join(" ");
-  assert.ok(nodeText.includes("环境变量名"), "节点配置只收环境变量名");
-  assert.ok(nodeText.includes("64 的倍数"), "把尺寸坑写在配置界面上");
-  assert.ok(!/secret|密码/i.test(nodeText), "不许在节点配置里收密钥");
-  assert.doesNotThrow(() => mod.NodeDialog({}), "节点配置缺 props 不崩");
-
-  // 公众号配置提交体：**留空 = 不改**。
-  // 踩过的坑：点「改配置」后表单是空的，直接保存会把已存好的 AppID / Secret 抹成空串。
-  const blankPayload = mod.wechatConfigPayload({ appId: "", appSecret: "", author: "", mode: "direct" });
-  assert.equal("appId" in blankPayload, false, "空 AppID 不能提交（会抹掉已存值）");
-  assert.equal("appSecret" in blankPayload, false, "空 Secret 不能提交");
-  assert.equal("gateway" in blankPayload, false, "直连模式不该带网关字段");
-  const editPayload = mod.wechatConfigPayload({
-    appId: "wx1234567890abcdef", appSecret: "s3cret", author: "作者",
-    mode: "gateway", gatewayURL: "https://gw.example", gatewayToken: "tk",
-  });
-  assert.equal(editPayload.appId, "wx1234567890abcdef", "填了就要提交");
-  assert.equal(editPayload.mode, "gateway", "模式跟着提交");
-  assert.equal(editPayload.gateway.baseURL, "https://gw.example", "网关模式要带地址");
-
+// 导出工具条 / 推草稿对话框 / 首启 / 节点配置 / 公众号配置提交体：ExportBar / PushDialog / LastPublishNotice / FirstRun / NodeDialog / wechatConfigPayload 都已移除
   // 右栏：四个 tab 都在，默认「意见」，同一时刻只亮一个面板
+  // 右栏：三个页签（第 N 段 / 图 N / 版式）。第一个是具体定位，默认选中它。
   const insp = mod.Inspector({
     ...props("article"),
     pipeline: { bound: false, gates: [] },
     pipeBlock: { pipeline: null, busy: false, root: "" },
   });
-  const tabLabels = collect(insp, (n) => /(^| )gzs-itab( |$)/.test(cls(n))).map((n) => texts(n).join(""));
-  assert.deepEqual(tabLabels, ["证据", "图", "元信息"], `三个 tab（意见栏已去掉），实际 ${JSON.stringify(tabLabels)}`);
-  assert.equal(collect(insp, (n) => /(^| )gzs-itab( |$)/.test(cls(n)) && cls(n).includes("gzs-itab--on")).length, 1, "只有一个 tab 是亮的");
-  assert.equal(texts(collect(insp, (n) => cls(n).includes("gzs-itab--on"))[0]).join(""), "证据", "默认停在「证据」");
+  const tabNodes = collect(insp, (n) => /(^| )gzs-itab( |$)/.test(cls(n)));
+  const tabLabels = tabNodes.map((n) => texts(n).join(""));
+  assert.deepEqual(tabLabels, ["整篇", "图2", "版式"],
+    `三个 tab（图带条数），实际 ${JSON.stringify(tabLabels)}`);
+  assert.equal(tabNodes.filter((n) => cls(n).includes("gzs-itab--on")).length, 1, "只有一个 tab 是亮的");
+  assert.equal(texts(tabNodes.find((n) => cls(n).includes("gzs-itab--on"))).join(""), "整篇", "默认停在「整篇」");
   assert.equal(collect(insp, (n) => cls(n).includes("gzs-itabpanel")).length, 3, "三个面板都渲染，靠 hidden 切换");
   assert.equal(collect(insp, (n) => cls(n).includes("gzs-itabpanel") && n.props.hidden !== true).length, 1, "同一时刻只亮一个面板");
-  // 受控 tab：切到「证据」能看到十道门的真结论
-  const evidenceTab = mod.Inspector({
-    ...props("article"), tab: "evidence",
-    pipeline: { bound: true, gates: [{ no: 3, key: "evidence", label: "证据台账", state: "ok", detail: "12 条逐字核过" }] },
+  // 上下文卡在最上面：先给「哪篇 / 哪段 / 卡在哪」，再给页签
+  assert.ok(texts(insp).join(" ").includes("当前工作上下文"), "右栏顶上有上下文卡");
+  // 受控 tab：切到「版式」能看到模板规格（原来这里验的是「证据」页，
+  // 那一页已随用户要求删除，十道门改由「检查」抽屉承载）
+  const layoutTab = mod.Inspector({
+    ...props("article"), tab: "layout",
+    pipeline: { bound: true, gates: [] },
     pipeBlock: { pipeline: { bound: false, gates: [] }, busy: false, root: "" },
   });
-  assert.ok(texts(evidenceTab).join(" ").includes("12 条逐字核过"), "「证据」tab 里能看到十道门结论");
-  assert.equal(texts(collect(evidenceTab, (n) => cls(n).includes("gzs-itab--on"))[0]).join(""), "证据", "受控 tab 生效");
+  assert.ok(texts(layoutTab).join(" ").includes("正文字号"), "「版式」tab 里有正文规格");
+  assert.ok(texts(collect(layoutTab, (n) => cls(n).includes("gzs-itab--on"))[0]).join("").startsWith("版式"),
+    "受控 tab 生效");
   // 「图」tab：一篇里所有槽位的缩略图，点一张切过去
   const board = mod.ImageBoard({ article: ARTICLE, onSelect: () => {} });
   assert.equal(collect(board, (n) => n.type === "img").length, 2, "封面 + 一段有图");
@@ -1470,7 +1394,8 @@ const PROPOSALS = [
   assert.equal(videoEls.length, 1, "有片就要有 <video>");
   assert.ok(String(videoEls[0].props?.src ?? "").includes("/api/gzh-studio.media"), "视频走媒体路由（带 Range）");
   const playerText = texts(player).join(" ");
-  assert.ok(playerText.includes("发布包") && playerText.includes("复制发布文案"), "发布包要能给文案");
+  // 这块改名叫「发布文案」了（视频号没有开放上传接口，只负责把文案拿得走）
+  assert.ok(playerText.includes("发布文案") && playerText.includes("复制发布文案"), "发布文案要能给文案");
   assert.ok(playerText.includes("2.0 MB"), "成片大小要标出来");
   const noFinal = mod.EpisodePlayer({ id: "FDE-02", data: { media: { final: [] } } });
   assert.ok(texts(noFinal).join(" ").includes("还没有成片"), "缺片要说清楚，不能空白");

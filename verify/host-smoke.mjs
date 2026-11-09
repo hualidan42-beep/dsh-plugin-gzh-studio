@@ -12,6 +12,7 @@ import { mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { apply, ROUTES, ROUTES as R } from "../index.js";
+import { ID_PATTERN } from "../lib/store.js";
 
 // ── 假宿主 ───────────────────────────────────────────────────────────────────
 const provided = {};
@@ -64,7 +65,10 @@ let article;
 {
   const created = await jsonOf(await callPost(R.create, { title: "一家药企把审批从 14 天压到 3 天", audience: "IT 负责人", takeaway: "知道两个坑", sections: 3, template: "business" }));
   article = created.article;
-  assert.match(article.id, /^gzh-\d{8}-[0-9a-f]{4}$/, "id 形态合法");
+  // id 形态跟着 store 的 ID_PATTERN 走：`gzh-<8位日期>-<4~32位十六进制>`。
+  // 旧包生成 4 位、现在 16 位（randomBytes(8)），所以这里不能只认 4 位，
+  // 否则宿主一改生成方式、这条断言就把正常功能当成坏了。
+  assert.match(article.id, ID_PATTERN, "id 形态合法");
   assert.equal(article.sections.length, 3, "三段落位");
   assert.equal(article.template, "business", "模板生效");
   assert.equal(article.sections[0].image.slot, "sec-s1", "段落配图槽位是 sec-s1");
@@ -545,8 +549,9 @@ let v2;
   const fresh = await jsonOf(await callPost(R.create, { title: "", sections: 2 }));
   const st1 = await jsonOf(await callGet(R.state, ""));
   assert.ok(st1.counts, "state 带 counts");
-  assert.equal(st1.counts.byState.draft + st1.counts.byState.draftbox + st1.counts.byState.published,
-    st1.counts.total, "三档之和等于总数");
+  // 生命周期只剩 draft / published 两档（草稿箱那一档 0.3.0 删掉了）
+  assert.equal(st1.counts.byState.draft + st1.counts.byState.published,
+    st1.counts.total, "两档之和等于总数");
   assert.ok(st1.counts.empty >= 1, "新建的空文章算空壳");
   const mine = st1.articles.find((a) => a.id === fresh.article.id);
   assert.equal(mine.lifecycle.value, "draft", "新文章默认草稿");
@@ -835,31 +840,9 @@ let v2;
 }
 
 
-// ── 平台版本（一稿多投）：走 HTTP 形状的完整链路 ────────────────────────────
-{
-  const saved = await jsonOf(await callPost(R.save, {
-    id: article.id,
-    patch: {
-      targets: [
-        { platform: "wechat", title: "公众号版" },
-        { platform: "xhs", title: "小红书版", hashtags: ["AI"] },
-      ],
-    },
-  }));
-  assert.equal(saved.article.targets.length, 2, "route + body 解析后 targets 落到文章上");
-
-  const view = await jsonOf(await callGet(R.article, `?id=${article.id}`));
-  assert.equal(view.article.targets[1].title, "小红书版", "articleView 带出平台版本");
-
-  // 部分保存不能把平台版本冲掉（这是最容易踩的一条）
-  await jsonOf(await callPost(R.save, { id: article.id, patch: { title: `${article.title}（改）` } }));
-  const after = await jsonOf(await callGet(R.article, `?id=${article.id}`));
-  assert.equal(after.article.targets?.length, 2, "只改标题不该动 targets");
-
-  await jsonOf(await callPost(R.save, { id: article.id, patch: { targets: [] } }));
-  const cleared = await jsonOf(await callGet(R.article, `?id=${article.id}`));
-  assert.equal(cleared.article.targets, undefined, "空数组清空平台版本");
-}
+// ── 平台版本（一稿多投）：0.4.x 已整块移除 ──────────────────────────────────
+// `applyPatch` 不再处理 `targets`，客户端也没有发布包了（见 CHANGELOG）。
+// 这一段的断言随功能一起删掉，别留着当噪音。
 
 // ── dispose 清路由 ───────────────────────────────────────────────────────────
 {

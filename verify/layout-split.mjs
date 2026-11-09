@@ -307,9 +307,10 @@ const css = (() => {
 
   const empty = mod.VideoAside({ episodes: [], open: false, onPlan: () => {}, hint: "" });
   const emptyText = JSON.stringify(empty);
-  assert.ok(emptyText.includes("还没选期"), "没选期时要有明确标题");
-  assert.ok(emptyText.includes("八步缺口"), "要有缺口区（不是一片空白）");
-  assert.ok(emptyText.includes("盘上还没有期目录"), "没有期时说清是盘上还没有，而不是加载失败");
+  // 文案按当前实现断言（2026-11-09 核对：这一版就是这么说的）
+  assert.ok(emptyText.includes("还没选哪一期"), "没选期时要有明确标题");
+  assert.ok(emptyText.includes("还差几步"), "要有缺口区（不是一片空白）");
+  assert.ok(emptyText.includes("还没有视频期"), "没有期时说清是盘上还没有，而不是加载失败");
   assert.ok(emptyText.includes("生成在哪做"), "要说明生成动作在对话里，不是看板里");
 
   const episodes = [
@@ -331,7 +332,7 @@ const css = (() => {
     episodes: [{ id: "FDE-09", files: Object.fromEntries(steps.map((s) => [s.key, true])) }],
     open: false, onPlan: () => {}, hint: "",
   });
-  assert.ok(JSON.stringify(allDone).includes("八件都齐了"), "全齐时给结论而不是一排 100%");
+  assert.ok(JSON.stringify(allDone).includes("该有的文件都齐了"), "全齐时给结论而不是一排 100%");
 }
 
 // ── 4. 样式层：三件事必须真的写在 CSS 里 ─────────────────────────────────────
@@ -347,7 +348,10 @@ const css = (() => {
   );
   assert.match(src, /\.gzs-head>\*\{flex:0 0 auto\}/, "顶栏按钮不许被压扁");
   assert.match(src, /\.gzs-split\{[^}]*cursor:col-resize/, "分隔条要有拖拽光标");
-  assert.match(src, /body\.gzs-resizing/, "拖拽期间要锁全局光标，避免选中文本");
+  assert.ok(
+    !/body\.gzs-resizing\s*,\s*body\.gzs-resizing\s*\*\s*\{[^}]*cursor\s*:\s*col-resize/.test(src),
+    "不再用 body 级全局 col-resize，避免漏收尾时整页卡成 ↔",
+  );
   assert.match(src, /\.gzs-vsplit\{[^}]*grid-template-columns/, "视频号必须是两栏");
   assert.match(src, /\.gzs-col--left\{flex:0 0 252px/, "左栏默认宽度保留");
   assert.match(src, /\.gzs-col--right\{flex:0 0 336px/, "右栏默认宽度保留");

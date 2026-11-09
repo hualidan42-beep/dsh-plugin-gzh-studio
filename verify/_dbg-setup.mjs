@@ -1,0 +1,13 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { apply, ROUTES as R } from "../index.js";
+import { REPO_ENV } from "../lib/repo.js";
+const repoRoot = await mkdtemp(join(tmpdir(), "gzs-dbg-"));
+process.env[REPO_ENV] = repoRoot;
+const routes = new Map();
+apply({ logger:{info(){},warn(){}}, effect(){}, provide(){}, connection:{fetch:{register:(s)=>{routes.set(s.path,s);return()=>{};}}} }, { root: join(repoRoot, ".wb") });
+const res = await routes.get(R.videoSetup).fetch({ url:"http://x"+R.videoSetup, json: async()=>({action:"create"}) });
+console.log("status:", res.status);
+console.log("body:", JSON.stringify(await res.json()).slice(0, 600));
+await rm(repoRoot,{recursive:true,force:true});

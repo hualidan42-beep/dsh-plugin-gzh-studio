@@ -1,0 +1,12 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { apply, ROUTES as R } from "../index.js";
+const routes=new Map();
+const root = await mkdtemp(join(tmpdir(), "gzs-brief-"));
+apply({ logger:{info(){},warn(){}}, effect(){}, provide(){}, connection:{ fetch:{ register:(s)=>{routes.set(s.path,s); return ()=>{};} } } }, { root });
+const get=(p,q="")=>routes.get(p).fetch({url:`http://x${p}${q}`,headers:new Headers()});
+const post=(p,b)=>routes.get(p).fetch({url:`http://x${p}`,json:async()=>b});
+const a = await (await post(R.create,{title:"一家药企把审批从 14 天压到 3 天",audience:"IT 负责人",sections:2})).json();
+console.log(await (await get(R.brief, `?id=${a.article.id}`)).text());
+await rm(root,{recursive:true,force:true});

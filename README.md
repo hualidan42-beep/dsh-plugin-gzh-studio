@@ -479,8 +479,9 @@ node verify/probe-node.mjs <token> # 只读探针：出图节点到底能不能�
 ```
 
 本机 3080 只认 `dsh-auth-*` cookie，URL 的 `?token=` 不能代替登录。`verify/cdp.mjs`
-会从 `D:/work/skill/output/dsh-cookie.txt` 读取 Netscape 格式 cookie，灌进无头 Chrome 后刷新一次；
-可用环境变量 `DSH_COOKIE_FILE` 换路径。cookie 缺失或过期时，页面会是 401 白页，症状通常是所有
+会从一个 Netscape 格式的 cookie 文件读取登录态——路径由环境变量 `DSH_COOKIE_FILE` 指定
+（默认 `<你的工作目录>/output/dsh-cookie.txt`）——灌进无头 Chrome 后刷新一次；
+cookie 缺失或过期时，页面会是 401 白页，症状通常是所有
 live 套件都报「等不到侧栏按钮」——先查登录，不要误判成插件没注册。
 
 `live-pipeline.mjs` 用演示文章绑真实期号，只为验界面能不能正确显示状态；**结尾一定解绑**，
@@ -530,7 +531,7 @@ node verify/shot-sections.mjs <token>              # 逐屏截手机预览，人
 ## 发布
 
 包名 `dsh-plugin-gzh-studio`。`package.json` 的 `files` 白名单只带运行需要的东西
-（22 个文件、解开约 0.76 MB）：`verify/`、`seeds/`、`*.bak` 和历史截图都不进包——
+（26 个文件、解开约 0.94 MB）：`verify/`、`seeds/`、`*.bak` 和历史截图都不进包——
 早期的包有 31 MB，就是因为没有 `files`。
 
 1. 改 `version`（semver）与 CHANGELOG；
